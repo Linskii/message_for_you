@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Create a message</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f5f0e8; --ink: #1a1a1a; --muted: #6b6558;
+      --accent: #8b3a3a; --border: #d4c9b0;
+    }
+    body { background: var(--bg); color: var(--ink); font-family: Georgia, serif; min-height: 100vh; }
+    .app { max-width: 700px; margin: 0 auto; padding: 2.5rem 1.5rem 4rem; }
+    h1 { font-size: 1.6rem; font-weight: normal; margin-bottom: 2rem; color: var(--accent); }
+    h2 { font-size: 1.1rem; font-weight: normal; margin-bottom: 1rem; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+    .section { margin-bottom: 2rem; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.4rem; }
+    textarea, input[type=text], select {
+      width: 100%; padding: 0.65rem 0.8rem; border: 1px solid var(--border);
+      background: #fff; font-family: inherit; font-size: 1rem; color: var(--ink);
+      border-radius: 3px; outline: none;
+    }
+    textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+    textarea { min-height: 160px; resize: vertical; line-height: 1.7; }
+    button {
+      cursor: pointer; padding: 0.65rem 1.5rem; border: none; border-radius: 3px;
+      font-family: inherit; font-size: 0.95rem;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: #7a2f2f; }
+    .btn-secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+    .btn-secondary:hover { background: rgba(139,58,58,0.06); }
+    .row { display: flex; gap: 0.75rem; align-items: flex-start; flex-wrap: wrap; }
+    .result-box {
+      margin-top: 1.5rem; padding: 1.25rem 1.5rem; background: #fff;
+      border: 1px solid var(--border); border-radius: 3px; display: none;
+    }
+    .result-box p { font-size: 0.9rem; color: var(--muted); margin-bottom: 0.5rem; }
+    .result-box .url {
+      font-family: monospace; font-size: 0.82rem; word-break: break-all;
+      color: var(--ink); background: var(--bg); padding: 0.6rem 0.8rem;
+      border: 1px solid var(--border); border-radius: 2px; display: block; margin-bottom: 0.75rem;
+    }
+
+    /* ── template editor ────────────────────────────────────────────── */
+    #template-editor { display: none; margin-top: 1rem; }
+    .canvas-wrap {
+      position: relative; border: 1px solid var(--border); border-radius: 3px;
+      overflow: hidden; background: #fff; cursor: crosshair;
+    }
+    #tpl-canvas { display: block; width: 100%; }
+    .tpl-controls { display: flex; gap: 0.75rem; align-items: center; margin-top: 0.75rem; flex-wrap: wrap; }
+    .tpl-controls label { margin: 0; }
+    .tpl-controls select, .tpl-controls input[type=text] { width: auto; }
+    #tpl-hint { font-size: 0.82rem; color: var(--muted); }
+
+    .tabs { display: flex; gap: 0; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+    .tab {
+      padding: 0.5rem 1.25rem; cursor: pointer; font-size: 0.95rem;
+      border: 1px solid transparent; border-bottom: none; border-radius: 3px 3px 0 0;
+      color: var(--muted); background: transparent; font-family: inherit;
+    }
+    .tab.active { border-color: var(--border); background: var(--bg); color: var(--ink); margin-bottom: -1px; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .notice { font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <h1>✉ Create a message</h1>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="compose">Compose</button>
+    <button class="tab" data-tab="templates">Templates</button>
+  </div>
+
+  <!-- ── COMPOSE TAB ──────────────────────────────────────────────────── -->
+  <div class="tab-panel active" id="tab-compose">
+    <div class="section">
+      <h2>Your message</h2>
+      <label for="msg-text">Write what you want to say</label>
+      <textarea id="msg-text" placeholder="Dear friend…"></textarea>
+    </div>
+
+    <div class="section">
+      <h2>Choose a template</h2>
+      <label for="tpl-select">Template skin</label>
+      <div class="row">
+        <select id="tpl-select" style="flex:1">
+          <option value="">— plain white —</option>
+        </select>
+        <button class="btn-secondary" id="btn-refresh-templates">↻ Refresh</button>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:1.5rem">
+      <button class="btn-primary" id="btn-create">Generate link ↗</button>
+    </div>
+
+    <div class="result-box" id="result-box">
+      <p>Share this link with the recipient — the key is embedded in the URL:</p>
+      <code class="url" id="result-url"></code>
+      <div class="row">
+        <button class="btn-primary" id="btn-copy">Copy link</button>
+        <button class="btn-secondary" id="btn-new">New message</button>
+      </div>
+      <p class="notice" style="margin-top:0.75rem">
+        Remember to <strong>git commit &amp; push</strong> so the encrypted message reaches GitHub Pages.
+      </p>
+    </div>
+  </div>
+
+  <!-- ── TEMPLATES TAB ────────────────────────────────────────────────── -->
+  <div class="tab-panel" id="tab-templates">
+    <div class="section">
+      <h2>Create a new template</h2>
+      <label for="tpl-id">Template name (used as folder name, no spaces)</label>
+      <input type="text" id="tpl-id" placeholder="e.g. hogwarts" />
+    </div>
+
+    <div class="section">
+      <label for="tpl-file">Upload cover image (PNG / JPG)</label>
+      <input type="file" id="tpl-file" accept="image/png,image/jpeg" style="margin-top:0.4rem" />
+    </div>
+
+    <div id="template-editor">
+      <h2>Draw the rip line</h2>
+      <p style="font-size:0.85rem;color:var(--muted);margin-bottom:0.75rem">
+        Click to place points across the image. The tear animation will follow this path.
+        Double-click or click "Done" to finish.
+      </p>
+      <div class="canvas-wrap">
+        <canvas id="tpl-canvas"></canvas>
+      </div>
+      <div class="tpl-controls">
+        <label>Jag style:</label>
+        <select id="tpl-jag">
+          <option value="straight">Straight cut</option>
+          <option value="light" selected>Lightly jagged</option>
+          <option value="heavy">Heavily jagged</option>
+        </select>
+        <button class="btn-secondary" id="btn-clear-line">Clear line</button>
+        <span id="tpl-hint">Click along the image to draw the rip line.</span>
+      </div>
+      <div class="row" style="margin-top:1rem">
+        <button class="btn-primary" id="btn-save-tpl">Save template</button>
+      </div>
+      <div id="tpl-result" style="display:none;margin-top:1rem;font-size:0.9rem;color:var(--muted)"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── tabs ─────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'))
+    document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'))
+    tab.classList.add('active')
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active')
+  })
+})
+
+// ── load templates ────────────────────────────────────────────────────────────
+async function loadTemplates() {
+  const sel = document.getElementById('tpl-select')
+  const current = sel.value
+  const list = await fetch('/api/templates').then((r) => r.json())
+  while (sel.options.length > 1) sel.remove(1)
+  list.forEach((id) => {
+    const opt = document.createElement('option')
+    opt.value = id
+    opt.textContent = id
+    sel.appendChild(opt)
+  })
+  if (current) sel.value = current
+}
+loadTemplates()
+document.getElementById('btn-refresh-templates').addEventListener('click', loadTemplates)
+
+// ── create message ────────────────────────────────────────────────────────────
+document.getElementById('btn-create').addEventListener('click', async () => {
+  const message = document.getElementById('msg-text').value.trim()
+  if (!message) { alert('Please write a message first.'); return }
+  const templateId = document.getElementById('tpl-select').value
+
+  const btn = document.getElementById('btn-create')
+  btn.textContent = 'Encrypting…'
+  btn.disabled = true
+
+  try {
+    const data = await fetch('/api/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, templateId }),
+    }).then((r) => r.json())
+
+    document.getElementById('result-url').textContent = data.shareUrl
+    document.getElementById('result-box').style.display = 'block'
+    document.getElementById('result-box').scrollIntoView({ behavior: 'smooth' })
+  } finally {
+    btn.textContent = 'Generate link ↗'
+    btn.disabled = false
+  }
+})
+
+document.getElementById('btn-copy').addEventListener('click', () => {
+  navigator.clipboard.writeText(document.getElementById('result-url').textContent)
+    .then(() => { document.getElementById('btn-copy').textContent = 'Copied!' })
+    .catch(() => {})
+  setTimeout(() => { document.getElementById('btn-copy').textContent = 'Copy link' }, 2000)
+})
+
+document.getElementById('btn-new').addEventListener('click', () => {
+  document.getElementById('result-box').style.display = 'none'
+  document.getElementById('msg-text').value = ''
+})
+
+// ── template editor ───────────────────────────────────────────────────────────
+let ripPoints = []   // [{x, y}] in canvas coords
+let imgEl = null
+let canvasW = 0, canvasH = 0
+
+const fileInput = document.getElementById('tpl-file')
+const editor = document.getElementById('template-editor')
+const canvas = document.getElementById('tpl-canvas')
+const ctx = canvas.getContext('2d')
+
+fileInput.addEventListener('change', (e) => {
+  const file = e.target.files[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = (ev) => {
+    imgEl = new Image()
+    imgEl.onload = () => {
+      // size canvas to image, max width 640
+      const maxW = 640
+      const scale = Math.min(1, maxW / imgEl.width)
+      canvasW = Math.round(imgEl.width * scale)
+      canvasH = Math.round(imgEl.height * scale)
+      canvas.width = canvasW
+      canvas.height = canvasH
+      canvas.style.height = canvasH + 'px'
+      ripPoints = []
+      editor.style.display = 'block'
+      redraw()
+    }
+    imgEl.src = ev.target.result
+  }
+  reader.readAsDataURL(file)
+})
+
+canvas.addEventListener('click', (e) => {
+  const r = canvas.getBoundingClientRect()
+  const scaleX = canvasW / r.width
+  const scaleY = canvasH / r.height
+  ripPoints.push({ x: (e.clientX - r.left) * scaleX, y: (e.clientY - r.top) * scaleY })
+  document.getElementById('tpl-hint').textContent = `${ripPoints.length} point(s) placed`
+  redraw()
+})
+
+canvas.addEventListener('dblclick', () => {
+  document.getElementById('tpl-hint').textContent = 'Line complete. Save when ready.'
+})
+
+document.getElementById('btn-clear-line').addEventListener('click', () => {
+  ripPoints = []
+  document.getElementById('tpl-hint').textContent = 'Click along the image to draw the rip line.'
+  redraw()
+})
+
+function redraw() {
+  ctx.clearRect(0, 0, canvasW, canvasH)
+  if (imgEl) ctx.drawImage(imgEl, 0, 0, canvasW, canvasH)
+
+  if (ripPoints.length < 1) return
+
+  // draw line
+  ctx.beginPath()
+  ctx.moveTo(ripPoints[0].x, ripPoints[0].y)
+  for (let i = 1; i < ripPoints.length; i++) ctx.lineTo(ripPoints[i].x, ripPoints[i].y)
+  ctx.strokeStyle = 'rgba(220, 60, 60, 0.85)'
+  ctx.lineWidth = 2
+  ctx.setLineDash([6, 4])
+  ctx.stroke()
+  ctx.setLineDash([])
+
+  // draw point handles
+  ripPoints.forEach((p) => {
+    ctx.beginPath()
+    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2)
+    ctx.fillStyle = 'rgba(220, 60, 60, 0.9)'
+    ctx.fill()
+  })
+}
+
+document.getElementById('btn-save-tpl').addEventListener('click', async () => {
+  const id = document.getElementById('tpl-id').value.trim().replace(/\s+/g, '-')
+  if (!id) { alert('Enter a template name.'); return }
+  if (!imgEl) { alert('Upload an image first.'); return }
+  if (ripPoints.length < 2) { alert('Place at least 2 points to define the rip line.'); return }
+
+  // normalise points to 0–1
+  const normalised = ripPoints.map((p) => [p.x / canvasW, p.y / canvasH])
+  const jagStyle = document.getElementById('tpl-jag').value
+
+  // get image as data URL from original file
+  const offscreen = document.createElement('canvas')
+  offscreen.width = canvasW
+  offscreen.height = canvasH
+  offscreen.getContext('2d').drawImage(imgEl, 0, 0, canvasW, canvasH)
+  const imageDataUrl = offscreen.toDataURL('image/png')
+
+  const btn = document.getElementById('btn-save-tpl')
+  btn.textContent = 'Saving…'
+  btn.disabled = true
+
+  try {
+    await fetch('/api/save-template', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, imageDataUrl, ripLine: normalised, jagStyle }),
+    })
+    document.getElementById('tpl-result').textContent = `Template "${id}" saved. Switch to Compose to use it.`
+    document.getElementById('tpl-result').style.display = 'block'
+    loadTemplates()
+  } finally {
+    btn.textContent = 'Save template'
+    btn.disabled = false
+  }
+})
+</script>
+</body>
+</html>
