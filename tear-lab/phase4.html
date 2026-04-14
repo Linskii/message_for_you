@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Verlet Tear Lab — Phase 4: Paper &amp; Peel</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #2a2a2a;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+    color: #bbb;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: normal;
+    margin: 0;
+    opacity: 0.7;
+    letter-spacing: 0.03em;
+  }
+  canvas {
+    background: #3a3a3a;
+    border: 1px solid #222;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<h1>Phase 4 — drag paper to peel &amp; tear it</h1>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  class Point {
+    constructor(x, y, r, c) {
+      this.x = x;
+      this.y = y;
+      this.old_x = x;
+      this.old_y = y;
+      this.pinned = false;
+      this.fixed = false;
+      this.r = r;
+      this.c = c;
+    }
+  }
+
+  class Constraint {
+    constructor(p1, p2) {
+      this.p1 = p1;
+      this.p2 = p2;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      this.restLength = Math.hypot(dx, dy);
+      this.broken = false;
+    }
+  }
+
+  const COLS = 40;
+  const ROWS = 30;
+  const SPACING = 14;
+  const originX = (W - (COLS - 1) * SPACING) / 2;
+  const originY = 40;
+
+  const points = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const p = new Point(originX + c * SPACING, originY + r * SPACING, r, c);
+      if (r === 0) {
+        p.pinned = true;
+        p.fixed = true;
+      }
+      points.push(p);
+    }
+  }
+
+  const idx = (r, c) => r * COLS + c;
+
+  // Per-edge lookup so we can tell if a quad's four sides are all intact.
+  // hC[r][c] = horizontal constraint between (r,c) and (r,c+1)
+  // vC[r][c] = vertical constraint between (r,c) and (r+1,c)
+  const hC = Array.from({ length: ROWS }, () => new Array(COLS - 1));
+  const vC = Array.from({ length: ROWS - 1 }, () => new Array(COLS));
+  const constraints = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS - 1; c++) {
+      const ct = new Constraint(points[idx(r, c)], points[idx(r, c + 1)]);
+      hC[r][c] = ct;
+      constraints.push(ct);
+    }
+  }
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const ct = new Constraint(points[idx(r, c)], points[idx(r + 1, c)]);
+      vC[r][c] = ct;
+      constraints.push(ct);
+    }
+  }
+
+  const GRAVITY = 0.25;
+  const FRICTION = 0.99;
+  const ITERATIONS = 8;
+  const PAD = 2;
+  const STRETCH_LIMIT = 3;
+
+  function integrate() {
+    for (const p of points) {
+      if (p.pinned) continue;
+      const vx = (p.x - p.old_x) * FRICTION;
+      const vy = (p.y - p.old_y) * FRICTION;
+      p.old_x = p.x;
+      p.old_y = p.y;
+      p.x += vx;
+      p.y += vy + GRAVITY;
+    }
+  }
+
+  function satisfyConstraints() {
+    for (let i = 0; i < ITERATIONS; i++) {
+      for (const ct of constraints) {
+        if (ct.broken) continue;
+        const dx = ct.p2.x - ct.p1.x;
+        const dy = ct.p2.y - ct.p1.y;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+        if (dist > ct.restLength * STRETCH_LIMIT) {
+          ct.broken = true;
+          continue;
+        }
+        const diff = (dist - ct.restLength) / dist;
+        const p1Pinned = ct.p1.pinned;
+        const p2Pinned = ct.p2.pinned;
+        if (p1Pinned && p2Pinned) continue;
+        if (p1Pinned) {
+          ct.p2.x -= dx * diff;
+          ct.p2.y -= dy * diff;
+        } else if (p2Pinned) {
+          ct.p1.x += dx * diff;
+          ct.p1.y += dy * diff;
+        } else {
+          const ox = dx * 0.5 * diff;
+          const oy = dy * 0.5 * diff;
+          ct.p1.x += ox;
+          ct.p1.y += oy;
+          ct.p2.x -= ox;
+          ct.p2.y -= oy;
+        }
+      }
+      for (const p of points) {
+        if (p.pinned) continue;
+        if (p.x < PAD) p.x = PAD;
+        else if (p.x > W - PAD) p.x = W - PAD;
+        if (p.y < PAD) p.y = PAD;
+        else if (p.y > H - PAD) p.y = H - PAD;
+      }
+    }
+  }
+
+  // A quad is drawable when all four of its edges are still intact.
+  function quadAlive(r, c) {
+    return !hC[r][c].broken
+        && !hC[r + 1][c].broken
+        && !vC[r][c].broken
+        && !vC[r][c + 1].broken;
+  }
+
+  // Membership test: is (r,c) the drag point or one of its orthogonal neighbors?
+  function isFlapVertex(r, c, drag) {
+    if (!drag) return false;
+    const dr = r - drag.r;
+    const dc = c - drag.c;
+    if (dr === 0 && dc === 0) return true;
+    if (dr === 0 && Math.abs(dc) === 1) return true;
+    if (dc === 0 && Math.abs(dr) === 1) return true;
+    return false;
+  }
+
+  function fillQuads(predicate) {
+    ctx.beginPath();
+    let any = false;
+    for (let r = 0; r < ROWS - 1; r++) {
+      for (let c = 0; c < COLS - 1; c++) {
+        if (!quadAlive(r, c)) continue;
+        if (!predicate(r, c)) continue;
+        const p00 = points[idx(r, c)];
+        const p01 = points[idx(r, c + 1)];
+        const p11 = points[idx(r + 1, c + 1)];
+        const p10 = points[idx(r + 1, c)];
+        ctx.moveTo(p00.x, p00.y);
+        ctx.lineTo(p01.x, p01.y);
+        ctx.lineTo(p11.x, p11.y);
+        ctx.lineTo(p10.x, p10.y);
+        ctx.closePath();
+        any = true;
+      }
+    }
+    if (any) ctx.fill();
+  }
+
+  const PAPER = '#f5efe4';
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+
+    const drag = dragPoint;
+    const flapPredicate = (r, c) => {
+      // quad belongs to flap layer if any of its 4 corners is drag vertex or neighbor
+      return isFlapVertex(r, c, drag)
+          || isFlapVertex(r, c + 1, drag)
+          || isFlapVertex(r + 1, c, drag)
+          || isFlapVertex(r + 1, c + 1, drag);
+    };
+    const basePredicate = (r, c) => !flapPredicate(r, c);
+
+    ctx.fillStyle = PAPER;
+
+    // Base layer — whole-paper drop shadow onto the background
+    ctx.shadowColor = 'rgba(0,0,0,0.35)';
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 4;
+    if (drag) {
+      fillQuads(basePredicate);
+    } else {
+      fillQuads(() => true);
+    }
+
+    // Flap layer — stronger shadow so the peeled bit looks lifted above the base
+    if (drag) {
+      ctx.shadowColor = 'rgba(0,0,0,0.45)';
+      ctx.shadowBlur = 16;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 8;
+      fillQuads(flapPredicate);
+    }
+
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetY = 0;
+
+    if (drag) {
+      ctx.fillStyle = 'rgba(40, 140, 200, 0.8)';
+      ctx.beginPath();
+      ctx.arc(drag.x, drag.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // --- interaction ---
+  let dragPoint = null;
+
+  function findNearest(mx, my) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of points) {
+      const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  function canvasCoords(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (W / rect.width),
+      y: (clientY - rect.top) * (H / rect.height),
+    };
+  }
+
+  function startDrag(clientX, clientY) {
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint = findNearest(x, y);
+    if (!dragPoint) return;
+    dragPoint.pinned = true;
+    dragPoint.x = x;
+    dragPoint.y = y;
+    dragPoint.old_x = x;
+    dragPoint.old_y = y;
+    canvas.classList.add('dragging');
+  }
+
+  function moveDrag(clientX, clientY) {
+    if (!dragPoint) return;
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint.x = x;
+    dragPoint.y = y;
+  }
+
+  function endDrag() {
+    if (dragPoint && !dragPoint.fixed) {
+      dragPoint.pinned = false;
+      dragPoint.old_x = dragPoint.x;
+      dragPoint.old_y = dragPoint.y;
+    }
+    dragPoint = null;
+    canvas.classList.remove('dragging');
+  }
+
+  canvas.addEventListener('mousedown', e => startDrag(e.clientX, e.clientY));
+  window.addEventListener('mousemove', e => moveDrag(e.clientX, e.clientY));
+  window.addEventListener('mouseup', endDrag);
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    startDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    moveDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    endDrag();
+  }, { passive: false });
+
+  function loop() {
+    integrate();
+    satisfyConstraints();
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
+</script>
+</body>
+</html>
