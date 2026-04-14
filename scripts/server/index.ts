@@ -31,7 +31,7 @@ async function getPagesBase(): Promise<string> {
 }
 
 function listTemplates(): string[] {
-  const templatesDir = path.join(ROOT, 'templates')
+  const templatesDir = path.join(ROOT, 'public', 'templates')
   if (!fs.existsSync(templatesDir)) return []
   return fs.readdirSync(templatesDir).filter((d) =>
     fs.statSync(path.join(templatesDir, d)).isDirectory(),
@@ -55,8 +55,8 @@ const server = http.createServer(async (req, res) => {
     const id = randomUUID()
     const envelope = { ciphertext, iv, templateId, createdAt: new Date().toISOString() }
 
-    const messagesDir = path.join(ROOT, 'messages')
-    if (!fs.existsSync(messagesDir)) fs.mkdirSync(messagesDir)
+    const messagesDir = path.join(ROOT, 'public', 'messages')
+    if (!fs.existsSync(messagesDir)) fs.mkdirSync(messagesDir, { recursive: true })
     fs.writeFileSync(path.join(messagesDir, `${id}.json`), JSON.stringify(envelope, null, 2))
 
     const base = await getPagesBase()
@@ -88,7 +88,7 @@ const server = http.createServer(async (req, res) => {
     }
     const { id, imageDataUrl, ripLine, jagStyle } = JSON.parse(body) as SaveTemplateBody
 
-    const dir = path.join(ROOT, 'templates', id)
+    const dir = path.join(ROOT, 'public', 'templates', id)
     fs.mkdirSync(dir, { recursive: true })
 
     // decode data URL → PNG file

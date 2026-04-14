@@ -9,7 +9,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
 
   root.innerHTML = `<p class="viewer-status">Opening your message…</p>`
 
-  // ── load message ────────────────────────────────────────────────────────────
+  // ── load message ─────────────────────────────────────────────────────────────
   let envelope: EncryptedMessage
   try {
     const res = await fetch(`${import.meta.env.BASE_URL}messages/${messageId}.json`)
@@ -20,7 +20,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
     return
   }
 
-  // ── decrypt ─────────────────────────────────────────────────────────────────
+  // ── decrypt ──────────────────────────────────────────────────────────────────
   let plaintext: string
   try {
     plaintext = await decryptMessage(envelope, keyB64)
@@ -29,7 +29,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
     return
   }
 
-  // ── load template ────────────────────────────────────────────────────────────
+  // ── load template ─────────────────────────────────────────────────────────────
   let template: TemplateConfig | null = null
   let coverUrl: string | null = null
   if (envelope.templateId) {
@@ -44,45 +44,45 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
     }
   }
 
-  // ── build DOM ────────────────────────────────────────────────────────────────
+  // ── build DOM — canvas only, no letter yet ───────────────────────────────────
   injectStyles()
 
   root.innerHTML = `
     <div class="viewer">
-      <div class="viewer__stage">
+      <div class="viewer__stage" id="stage">
         <canvas class="viewer__canvas" id="tear-canvas"></canvas>
-        <div class="viewer__letter" id="letter" hidden>
-          <div class="letter__paper">
-            <p class="letter__text">${escapeHtml(plaintext)}</p>
-          </div>
-        </div>
       </div>
     </div>
   `
 
   const canvas = document.getElementById('tear-canvas') as HTMLCanvasElement
-  const letterEl = document.getElementById('letter') as HTMLDivElement
-  const stage = canvas.parentElement!
+  const stage = document.getElementById('stage') as HTMLDivElement
 
-  // size canvas to stage
-  const resize = () => {
-    canvas.width = stage.clientWidth
-    canvas.height = stage.clientHeight
-    tc?.resize(canvas.width, canvas.height)
-  }
+  requestAnimationFrame(() => {
+    canvas.width = stage.clientWidth || 480
+    canvas.height = stage.clientHeight || 680
 
-  let tc: TearCanvas | null = null
-  tc = new TearCanvas(canvas, {
-    coverUrl,
-    jagStyle: template?.jagStyle ?? 'light',
-    onRevealed: () => {
-      canvas.style.display = 'none'
-      letterEl.hidden = false
-    },
+    const tc = new TearCanvas(canvas, {
+      coverUrl,
+      jagStyle: template?.jagStyle ?? 'light',
+      onRevealed: () => {
+        // Replace canvas with the letter
+        stage.innerHTML = `
+          <div class="viewer__letter">
+            <div class="letter__paper">
+              <p class="letter__text">${escapeHtml(plaintext)}</p>
+            </div>
+          </div>
+        `
+      },
+    })
+
+    window.addEventListener('resize', () => {
+      canvas.width = stage.clientWidth
+      canvas.height = stage.clientHeight
+      tc.resize(canvas.width, canvas.height)
+    })
   })
-
-  window.addEventListener('resize', resize)
-  resize()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -102,7 +102,8 @@ function escapeHtml(s: string): string {
 }
 
 function injectStyles(): void {
-  if (document.getElementById('viewer-styles')) return
+  const existing = document.getElementById('viewer-styles')
+  if (existing) existing.remove() // always refresh styles
   const style = document.createElement('style')
   style.id = 'viewer-styles'
   style.textContent = `
@@ -131,6 +132,7 @@ function injectStyles(): void {
       overflow: hidden;
       box-shadow: 0 8px 40px rgba(0,0,0,0.12);
       cursor: crosshair;
+      background: #fff;
     }
 
     .viewer__canvas {
@@ -138,6 +140,7 @@ function injectStyles(): void {
       width: 100%;
       height: 100%;
       touch-action: none;
+      background: #fff;
     }
 
     .viewer__letter {
@@ -149,6 +152,7 @@ function injectStyles(): void {
       background: var(--bg);
       padding: 2rem;
       overflow-y: auto;
+      animation: letterReveal 0.4s ease both;
     }
 
     .letter__paper {
@@ -158,7 +162,6 @@ function injectStyles(): void {
       padding: 2.5rem 3rem;
       max-width: 100%;
       box-shadow: 0 2px 16px rgba(0,0,0,0.06);
-      animation: letterReveal 0.5s ease both;
     }
 
     @keyframes letterReveal {

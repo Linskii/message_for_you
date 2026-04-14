@@ -38,5 +38,8 @@ function bufToB64(buf: ArrayBuffer | Uint8Array): string {
 }
 
 function b64ToBuf(b64: string): ArrayBuffer {
-  return Buffer.from(b64, 'base64').buffer as ArrayBuffer
+  const buf = Buffer.from(b64, 'base64')
+  const ab = new ArrayBuffer(buf.length)
+  new Uint8Array(ab).set(buf)
+  return ab
 }
