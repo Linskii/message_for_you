@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Verlet Tear Lab — Phase 1: Physics Grid</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #1a1a1a;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+    color: #bbb;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: normal;
+    margin: 0;
+    opacity: 0.7;
+    letter-spacing: 0.03em;
+  }
+  canvas {
+    background: #fafafa;
+    border: 1px solid #333;
+    display: block;
+  }
+</style>
+</head>
+<body>
+<h1>Phase 1 — Verlet physics grid</h1>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  class Point {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+      this.old_x = x;
+      this.old_y = y;
+    }
+  }
+
+  class Constraint {
+    constructor(p1, p2) {
+      this.p1 = p1;
+      this.p2 = p2;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      this.restLength = Math.hypot(dx, dy);
+    }
+  }
+
+  const COLS = 40;
+  const ROWS = 30;
+  const SPACING = 14;
+  const originX = (W - (COLS - 1) * SPACING) / 2;
+  const originY = (H - (ROWS - 1) * SPACING) / 2;
+
+  const points = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      points.push(new Point(originX + c * SPACING, originY + r * SPACING));
+    }
+  }
+
+  const idx = (r, c) => r * COLS + c;
+  const constraints = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (c < COLS - 1) constraints.push(new Constraint(points[idx(r, c)], points[idx(r, c + 1)]));
+      if (r < ROWS - 1) constraints.push(new Constraint(points[idx(r, c)], points[idx(r + 1, c)]));
+    }
+  }
+
+  const GRAVITY = 0.25;
+  const FRICTION = 0.99;
+  const ITERATIONS = 8;
+  const PAD = 2;
+
+  function integrate() {
+    for (const p of points) {
+      const vx = (p.x - p.old_x) * FRICTION;
+      const vy = (p.y - p.old_y) * FRICTION;
+      p.old_x = p.x;
+      p.old_y = p.y;
+      p.x += vx;
+      p.y += vy + GRAVITY;
+    }
+  }
+
+  function satisfyConstraints() {
+    for (let i = 0; i < ITERATIONS; i++) {
+      for (const ct of constraints) {
+        const dx = ct.p2.x - ct.p1.x;
+        const dy = ct.p2.y - ct.p1.y;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+        const diff = (dist - ct.restLength) / dist;
+        const ox = dx * 0.5 * diff;
+        const oy = dy * 0.5 * diff;
+        ct.p1.x += ox;
+        ct.p1.y += oy;
+        ct.p2.x -= ox;
+        ct.p2.y -= oy;
+      }
+      for (const p of points) {
+        if (p.x < PAD) p.x = PAD;
+        else if (p.x > W - PAD) p.x = W - PAD;
+        if (p.y < PAD) p.y = PAD;
+        else if (p.y > H - PAD) p.y = H - PAD;
+      }
+    }
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.strokeStyle = '#bbb';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const ct of constraints) {
+      ctx.moveTo(ct.p1.x, ct.p1.y);
+      ctx.lineTo(ct.p2.x, ct.p2.y);
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = '#000';
+    for (const p of points) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function loop() {
+    integrate();
+    satisfyConstraints();
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
+</script>
+</body>
+</html>

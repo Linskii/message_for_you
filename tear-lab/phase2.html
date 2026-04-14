@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Verlet Tear Lab — Phase 2: Pinning + Drag</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #1a1a1a;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+    color: #bbb;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: normal;
+    margin: 0;
+    opacity: 0.7;
+    letter-spacing: 0.03em;
+  }
+  canvas {
+    background: #fafafa;
+    border: 1px solid #333;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<h1>Phase 2 — top row pinned, click &amp; drag any point</h1>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  class Point {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+      this.old_x = x;
+      this.old_y = y;
+      this.pinned = false;   // currently locked (fixed row OR being dragged)
+      this.fixed = false;    // permanently pinned (top row)
+    }
+  }
+
+  class Constraint {
+    constructor(p1, p2) {
+      this.p1 = p1;
+      this.p2 = p2;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      this.restLength = Math.hypot(dx, dy);
+    }
+  }
+
+  const COLS = 40;
+  const ROWS = 30;
+  const SPACING = 14;
+  const originX = (W - (COLS - 1) * SPACING) / 2;
+  const originY = (H - (ROWS - 1) * SPACING) / 2;
+
+  const points = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const p = new Point(originX + c * SPACING, originY + r * SPACING);
+      if (r === 0) {
+        p.pinned = true;
+        p.fixed = true;
+      }
+      points.push(p);
+    }
+  }
+
+  const idx = (r, c) => r * COLS + c;
+  const constraints = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (c < COLS - 1) constraints.push(new Constraint(points[idx(r, c)], points[idx(r, c + 1)]));
+      if (r < ROWS - 1) constraints.push(new Constraint(points[idx(r, c)], points[idx(r + 1, c)]));
+    }
+  }
+
+  const GRAVITY = 0.25;
+  const FRICTION = 0.99;
+  const ITERATIONS = 8;
+  const PAD = 2;
+
+  function integrate() {
+    for (const p of points) {
+      if (p.pinned) continue;
+      const vx = (p.x - p.old_x) * FRICTION;
+      const vy = (p.y - p.old_y) * FRICTION;
+      p.old_x = p.x;
+      p.old_y = p.y;
+      p.x += vx;
+      p.y += vy + GRAVITY;
+    }
+  }
+
+  function satisfyConstraints() {
+    for (let i = 0; i < ITERATIONS; i++) {
+      for (const ct of constraints) {
+        const dx = ct.p2.x - ct.p1.x;
+        const dy = ct.p2.y - ct.p1.y;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+        const diff = (dist - ct.restLength) / dist;
+        const p1Pinned = ct.p1.pinned;
+        const p2Pinned = ct.p2.pinned;
+        if (p1Pinned && p2Pinned) continue;
+        if (p1Pinned) {
+          ct.p2.x -= dx * diff;
+          ct.p2.y -= dy * diff;
+        } else if (p2Pinned) {
+          ct.p1.x += dx * diff;
+          ct.p1.y += dy * diff;
+        } else {
+          const ox = dx * 0.5 * diff;
+          const oy = dy * 0.5 * diff;
+          ct.p1.x += ox;
+          ct.p1.y += oy;
+          ct.p2.x -= ox;
+          ct.p2.y -= oy;
+        }
+      }
+      for (const p of points) {
+        if (p.pinned) continue;
+        if (p.x < PAD) p.x = PAD;
+        else if (p.x > W - PAD) p.x = W - PAD;
+        if (p.y < PAD) p.y = PAD;
+        else if (p.y > H - PAD) p.y = H - PAD;
+      }
+    }
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.strokeStyle = '#bbb';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const ct of constraints) {
+      ctx.moveTo(ct.p1.x, ct.p1.y);
+      ctx.lineTo(ct.p2.x, ct.p2.y);
+    }
+    ctx.stroke();
+
+    for (const p of points) {
+      if (p === dragPoint) continue;
+      ctx.fillStyle = p.fixed ? '#c23' : '#000';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.fixed ? 2.5 : 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (dragPoint) {
+      ctx.fillStyle = '#28a';
+      ctx.beginPath();
+      ctx.arc(dragPoint.x, dragPoint.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // --- interaction ---
+  let dragPoint = null;
+
+  function findNearest(mx, my) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of points) {
+      const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  function canvasCoords(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (W / rect.width),
+      y: (clientY - rect.top) * (H / rect.height),
+    };
+  }
+
+  function startDrag(clientX, clientY) {
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint = findNearest(x, y);
+    if (!dragPoint) return;
+    dragPoint.pinned = true;
+    dragPoint.x = x;
+    dragPoint.y = y;
+    dragPoint.old_x = x;
+    dragPoint.old_y = y;
+    canvas.classList.add('dragging');
+  }
+
+  function moveDrag(clientX, clientY) {
+    if (!dragPoint) return;
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint.x = x;
+    dragPoint.y = y;
+  }
+
+  function endDrag() {
+    if (dragPoint && !dragPoint.fixed) {
+      dragPoint.pinned = false;
+      // seed velocity from last mouse motion so the point keeps its momentum
+      dragPoint.old_x = dragPoint.x;
+      dragPoint.old_y = dragPoint.y;
+    }
+    dragPoint = null;
+    canvas.classList.remove('dragging');
+  }
+
+  canvas.addEventListener('mousedown', e => startDrag(e.clientX, e.clientY));
+  window.addEventListener('mousemove', e => moveDrag(e.clientX, e.clientY));
+  window.addEventListener('mouseup', endDrag);
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    startDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    moveDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    endDrag();
+  }, { passive: false });
+
+  function loop() {
+    integrate();
+    satisfyConstraints();
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
+</script>
+</body>
+</html>
