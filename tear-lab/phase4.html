@@ -47,6 +47,16 @@
   const W = canvas.width;
   const H = canvas.height;
 
+  // Offscreen buffer — we draw a layer of paper into it (no shadow), then
+  // blit that single image onto the main canvas with a shadow. Shadows in
+  // 2D canvas get applied per-subpath inside a single fill(), which bleeds
+  // onto interior quad edges; routing through a buffer shadows the silhouette
+  // only, which is what we want for a solid paper look.
+  const offCanvas = document.createElement('canvas');
+  offCanvas.width = W;
+  offCanvas.height = H;
+  const offCtx = offCanvas.getContext('2d');
+
   class Point {
     constructor(x, y, r, c) {
       this.x = x;
@@ -71,9 +81,9 @@
     }
   }
 
-  const COLS = 40;
-  const ROWS = 30;
-  const SPACING = 14;
+  const COLS = 80;
+  const ROWS = 60;
+  const SPACING = 7;
   const originX = (W - (COLS - 1) * SPACING) / 2;
   const originY = 40;
 
@@ -117,6 +127,22 @@
   const ITERATIONS = 8;
   const PAD = 2;
   const STRETCH_LIMIT = 3;
+
+  // A quad is back-coloured only when its winding is flipped AND it belongs
+  // to a connected run of flipped quads this large — single flickering
+  // cells on a fold crease are suppressed.
+  const BACK_MIN_COMPONENT = 3;
+
+  const QROWS = ROWS - 1;
+  const QCOLS = COLS - 1;
+  const qIdx = (r, c) => r * QCOLS + c;
+
+  // Reusable per-frame buffers for the fold-detection pass.
+  const flipped = new Uint8Array(QROWS * QCOLS);
+  const compId = new Int32Array(QROWS * QCOLS);
+  const isBack = new Uint8Array(QROWS * QCOLS);
+  const compSize = [];
+  const floodQueue = [];
 
   function integrate() {
     for (const p of points) {
@@ -189,68 +215,165 @@
     return false;
   }
 
-  function fillQuads(predicate) {
-    ctx.beginPath();
-    let any = false;
-    for (let r = 0; r < ROWS - 1; r++) {
-      for (let c = 0; c < COLS - 1; c++) {
+  // Shoelace signed area for a quad in winding order (p00, p01, p11, p10).
+  // At rest the quad is wound clockwise in screen coords → positive.
+  // When the paper folds over itself the vertex order mirrors → negative,
+  // which is how we know we're looking at the back of the sheet.
+  function quadSignedArea(p00, p01, p11, p10) {
+    return 0.5 * (
+      (p00.x * p01.y - p01.x * p00.y) +
+      (p01.x * p11.y - p11.x * p01.y) +
+      (p11.x * p10.y - p10.x * p11.y) +
+      (p10.x * p00.y - p00.x * p10.y)
+    );
+  }
+
+  // Find connected runs of flipped quads (via intact shared edges) and
+  // only mark a cell as "back" if its component reaches BACK_MIN_COMPONENT.
+  // This suppresses the single-quad flicker along a fold crease while
+  // letting any real fold region (which is always several contiguous
+  // flipped cells) render as back-of-paper.
+  function computeBackFacing() {
+    flipped.fill(0);
+    compId.fill(-1);
+    isBack.fill(0);
+    compSize.length = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const p00 = points[idx(r, c)];
+        const p01 = points[idx(r, c + 1)];
+        const p11 = points[idx(r + 1, c + 1)];
+        const p10 = points[idx(r + 1, c)];
+        if (quadSignedArea(p00, p01, p11, p10) < 0) {
+          flipped[qIdx(r, c)] = 1;
+        }
+      }
+    }
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        const startI = qIdx(r, c);
+        if (!flipped[startI] || compId[startI] !== -1) continue;
+        const id = compSize.length;
+        compSize.push(1);
+        compId[startI] = id;
+        floodQueue.length = 0;
+        floodQueue.push(startI);
+        while (floodQueue.length) {
+          const curr = floodQueue.pop();
+          const rr = (curr / QCOLS) | 0;
+          const cc = curr - rr * QCOLS;
+          // Four neighbours connected iff the shared edge is still intact.
+          if (cc + 1 < QCOLS && !vC[rr][cc + 1].broken) {
+            const j = qIdx(rr, cc + 1);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (cc > 0 && !vC[rr][cc].broken) {
+            const j = qIdx(rr, cc - 1);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr + 1 < QROWS && !hC[rr + 1][cc].broken) {
+            const j = qIdx(rr + 1, cc);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr > 0 && !hC[rr][cc].broken) {
+            const j = qIdx(rr - 1, cc);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < flipped.length; i++) {
+      if (flipped[i] && compSize[compId[i]] >= BACK_MIN_COMPONENT) {
+        isBack[i] = 1;
+      }
+    }
+  }
+
+  // Draw every alive quad matching `predicate` into the offscreen buffer,
+  // split into two paths (front / back) so folded-over cells can be tinted
+  // differently.
+  function drawQuadLayer(predicate) {
+    offCtx.clearRect(0, 0, W, H);
+    const frontPath = new Path2D();
+    const backPath = new Path2D();
+    let hasFront = false;
+    let hasBack = false;
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
         if (!quadAlive(r, c)) continue;
         if (!predicate(r, c)) continue;
         const p00 = points[idx(r, c)];
         const p01 = points[idx(r, c + 1)];
         const p11 = points[idx(r + 1, c + 1)];
         const p10 = points[idx(r + 1, c)];
-        ctx.moveTo(p00.x, p00.y);
-        ctx.lineTo(p01.x, p01.y);
-        ctx.lineTo(p11.x, p11.y);
-        ctx.lineTo(p10.x, p10.y);
-        ctx.closePath();
-        any = true;
+        const back = isBack[qIdx(r, c)];
+        const path = back ? backPath : frontPath;
+        path.moveTo(p00.x, p00.y);
+        path.lineTo(p01.x, p01.y);
+        path.lineTo(p11.x, p11.y);
+        path.lineTo(p10.x, p10.y);
+        path.closePath();
+        if (back) hasBack = true; else hasFront = true;
       }
     }
-    if (any) ctx.fill();
+    if (hasFront) {
+      offCtx.fillStyle = PAPER_FRONT;
+      offCtx.fill(frontPath);
+    }
+    if (hasBack) {
+      offCtx.fillStyle = PAPER_BACK;
+      offCtx.fill(backPath);
+    }
+    return hasFront || hasBack;
   }
 
-  const PAPER = '#f5efe4';
+  const PAPER_FRONT = '#f5efe4';
+  const PAPER_BACK = '#c9bc9f';
+
+  function blitLayer(shadowColor, shadowBlur, shadowOffsetY) {
+    ctx.save();
+    ctx.shadowColor = shadowColor;
+    ctx.shadowBlur = shadowBlur;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = shadowOffsetY;
+    ctx.drawImage(offCanvas, 0, 0);
+    ctx.restore();
+  }
 
   function render() {
     ctx.clearRect(0, 0, W, H);
+    computeBackFacing();
 
     const drag = dragPoint;
-    const flapPredicate = (r, c) => {
-      // quad belongs to flap layer if any of its 4 corners is drag vertex or neighbor
-      return isFlapVertex(r, c, drag)
-          || isFlapVertex(r, c + 1, drag)
-          || isFlapVertex(r + 1, c, drag)
-          || isFlapVertex(r + 1, c + 1, drag);
-    };
+    const flapPredicate = (r, c) =>
+      isFlapVertex(r, c, drag)
+      || isFlapVertex(r, c + 1, drag)
+      || isFlapVertex(r + 1, c, drag)
+      || isFlapVertex(r + 1, c + 1, drag);
     const basePredicate = (r, c) => !flapPredicate(r, c);
 
-    ctx.fillStyle = PAPER;
-
-    // Base layer — whole-paper drop shadow onto the background
-    ctx.shadowColor = 'rgba(0,0,0,0.35)';
-    ctx.shadowBlur = 10;
-    ctx.shadowOffsetX = 0;
-    ctx.shadowOffsetY = 4;
-    if (drag) {
-      fillQuads(basePredicate);
-    } else {
-      fillQuads(() => true);
+    // Base paper — soft drop shadow so the whole sheet sits above the canvas bg
+    if (drawQuadLayer(drag ? basePredicate : () => true)) {
+      blitLayer('rgba(0,0,0,0.35)', 10, 4);
     }
 
-    // Flap layer — stronger shadow so the peeled bit looks lifted above the base
-    if (drag) {
-      ctx.shadowColor = 'rgba(0,0,0,0.45)';
-      ctx.shadowBlur = 16;
-      ctx.shadowOffsetX = 0;
-      ctx.shadowOffsetY = 8;
-      fillQuads(flapPredicate);
+    // Flap — heavier, larger shadow so its outline falls clearly onto the
+    // base paper we just drew. This is what sells the peel.
+    if (drag && drawQuadLayer(flapPredicate)) {
+      blitLayer('rgba(0,0,0,0.55)', 18, 10);
     }
-
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-    ctx.shadowOffsetY = 0;
 
     if (drag) {
       ctx.fillStyle = 'rgba(40, 140, 200, 0.8)';
