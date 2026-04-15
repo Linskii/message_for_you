@@ -178,15 +178,70 @@
   }
   const tearPathLen = tearPath.length;
 
-  // Paper is much stiffer than phase 5 (STRETCH_LIMIT was 3). A tearable
-  // edge only breaks if it's a path endpoint (at the paper's left/right
-  // boundary) OR a tear-path neighbour has already broken — so tears can
-  // only propagate inward from the sides.
-  const GRAVITY = 0.0;
+  // Tag every node with which side of the tear path it's on. `isTopHalf` is
+  // used by: (a) gravity (only top nodes fall), (b) constraint classification
+  // into top / bottom / cross buckets.
+  for (const p of points) {
+    p.isTopHalf = (p.r <= pathRowAt[p.c]);
+  }
+
+  // Diagonal shear constraints — one pair per quad cell, connecting opposite
+  // corners. They resist parallelogram-ing (which the 4-edge grid alone
+  // can't prevent) while still allowing rotation between cells, so folds
+  // still work. A diagonal is treated as broken as soon as any of its cell's
+  // four edges break, so a torn cell can actually separate.
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS - 1; c++) {
+      const cellEdges = [hC[r][c], hC[r + 1][c], vC[r][c], vC[r][c + 1]];
+      const d1 = new Constraint(points[idx(r, c)], points[idx(r + 1, c + 1)]);
+      const d2 = new Constraint(points[idx(r, c + 1)], points[idx(r + 1, c)]);
+      d1.cellEdges = cellEdges;
+      d2.cellEdges = cellEdges;
+      constraints.push(d1);
+      constraints.push(d2);
+    }
+  }
+
+  // Breakable pins holding the top row to its initial position. While a pin
+  // holds, the node is snapped back to its anchor each iteration. If a single
+  // iteration's drift (from gravity, drag, or neighbour-tension) exceeds
+  // PIN_BREAK_DIST, the pin snaps permanently and the node becomes free —
+  // simulating the top flap ripping away from the envelope edge.
+  const pinAnchors = [];
+  for (let c = 0; c < COLS; c++) {
+    const p = points[idx(0, c)];
+    pinAnchors.push({ p, ax: p.x, ay: p.y, broken: false });
+  }
+
+  // Split all constraints (edges + diagonals) by which half they belong to.
+  // Cross constraints are exactly the edges/diagonals that span the tear —
+  // the tearable ones plus any diagonals straddling the tear line.
+  const topConstraints = [];
+  const bottomConstraints = [];
+  const crossConstraints = [];
+  for (const ct of constraints) {
+    const a = ct.p1.isTopHalf;
+    const b = ct.p2.isTopHalf;
+    if (a && b) topConstraints.push(ct);
+    else if (!a && !b) bottomConstraints.push(ct);
+    else crossConstraints.push(ct);
+  }
+
+  // Physics knobs. GRAVITY only applies above the tear. TOP/BOTTOM/CROSS
+  // _STIFFNESS are extra relax passes per main iteration for each bucket —
+  // bump BOTTOM_STIFFNESS to pin the letter body harder, bump TOP_STIFFNESS
+  // if the flap feels too rubbery, bump CROSS_STIFFNESS if the perforation
+  // itself stretches too much before tearing. PIN_BREAK_DIST is the per-
+  // iteration drift at which a top-row pin snaps.
+  const GRAVITY = 0.25;
   const FRICTION = 0.95;
-  const ITERATIONS = 15;
+  const ITERATIONS = 12;
+  const TOP_STIFFNESS = 0.2;
+  const BOTTOM_STIFFNESS = 1;
+  const CROSS_STIFFNESS = 1;
   const PAD = 2;
-  const STRETCH_LIMIT = 1.15;
+  const STRETCH_LIMIT = 1.05;
+  const PIN_BREAK_DIST = SPACING * 0.1;
 
   const BACK_MIN_COMPONENT = 3;
   const MAX_LAYER = 2;
@@ -216,7 +271,8 @@
       p.old_x = p.x;
       p.old_y = p.y;
       p.x += vx;
-      p.y += vy + GRAVITY;
+      // Gravity only above the tear — the letter body (below) should sit still.
+      p.y += vy + (p.isTopHalf ? GRAVITY : 0);
     }
   }
 
@@ -252,46 +308,86 @@
     dragPoint.old_y = ty;
   }
 
+  function relaxConstraint(ct) {
+    if (ct.broken) return;
+    // A diagonal follows its cell: as soon as any edge of its cell breaks,
+    // the diagonal can't pretend the cell is still intact.
+    if (ct.cellEdges !== undefined) {
+      const e = ct.cellEdges;
+      if (e[0].broken || e[1].broken || e[2].broken || e[3].broken) {
+        ct.broken = true;
+        return;
+      }
+    }
+    const dx = ct.p2.x - ct.p1.x;
+    const dy = ct.p2.y - ct.p1.y;
+    const dist = Math.hypot(dx, dy) || 0.0001;
+
+    if (ct.tearable && dist > ct.restLength * STRETCH_LIMIT) {
+      const pi = ct.pathIndex;
+      const isEndpoint = (pi === 0 || pi === tearPathLen - 1);
+      const prevBroken = pi > 0 && tearPath[pi - 1].broken;
+      const nextBroken = pi < tearPathLen - 1 && tearPath[pi + 1].broken;
+      if (isEndpoint || prevBroken || nextBroken) {
+        ct.broken = true;
+        return;
+      }
+    }
+
+    const diff = (dist - ct.restLength) / dist;
+    const p1Pinned = ct.p1.pinned;
+    const p2Pinned = ct.p2.pinned;
+    if (p1Pinned && p2Pinned) return;
+    if (p1Pinned) {
+      ct.p2.x -= dx * diff;
+      ct.p2.y -= dy * diff;
+    } else if (p2Pinned) {
+      ct.p1.x += dx * diff;
+      ct.p1.y += dy * diff;
+    } else {
+      const ox = dx * 0.5 * diff;
+      const oy = dy * 0.5 * diff;
+      ct.p1.x += ox;
+      ct.p1.y += oy;
+      ct.p2.x -= ox;
+      ct.p2.y -= oy;
+    }
+  }
+
+  function relaxGroup(group) {
+    for (const ct of group) relaxConstraint(ct);
+  }
+
+  // Breakable-pin pass. The dragged node skips this so the user can freely
+  // move it; pins on other top-row nodes snap their points back to the
+  // anchor, unless the drift in a single iteration exceeds PIN_BREAK_DIST
+  // (meaning something — neighbour tension or gravity — is pulling hard
+  // enough to rip the pin off), in which case the pin breaks permanently.
+  function satisfyPins() {
+    for (const pin of pinAnchors) {
+      if (pin.broken) continue;
+      if (pin.p === dragPoint) continue;
+      const dx = pin.p.x - pin.ax;
+      const dy = pin.p.y - pin.ay;
+      const d = Math.hypot(dx, dy);
+      if (d > PIN_BREAK_DIST) {
+        pin.broken = true;
+        continue;
+      }
+      pin.p.x = pin.ax;
+      pin.p.y = pin.ay;
+      pin.p.old_x = pin.ax;
+      pin.p.old_y = pin.ay;
+    }
+  }
+
   function satisfyConstraints() {
     for (let i = 0; i < ITERATIONS; i++) {
       clampDragPoint();
-      for (const ct of constraints) {
-        if (ct.broken) continue;
-        const dx = ct.p2.x - ct.p1.x;
-        const dy = ct.p2.y - ct.p1.y;
-        const dist = Math.hypot(dx, dy) || 0.0001;
-
-        if (ct.tearable && dist > ct.restLength * STRETCH_LIMIT) {
-          const pi = ct.pathIndex;
-          const isEndpoint = (pi === 0 || pi === tearPathLen - 1);
-          const prevBroken = pi > 0 && tearPath[pi - 1].broken;
-          const nextBroken = pi < tearPathLen - 1 && tearPath[pi + 1].broken;
-          if (isEndpoint || prevBroken || nextBroken) {
-            ct.broken = true;
-            continue;
-          }
-          // Can't break yet — fall through to relax hard.
-        }
-
-        const diff = (dist - ct.restLength) / dist;
-        const p1Pinned = ct.p1.pinned;
-        const p2Pinned = ct.p2.pinned;
-        if (p1Pinned && p2Pinned) continue;
-        if (p1Pinned) {
-          ct.p2.x -= dx * diff;
-          ct.p2.y -= dy * diff;
-        } else if (p2Pinned) {
-          ct.p1.x += dx * diff;
-          ct.p1.y += dy * diff;
-        } else {
-          const ox = dx * 0.5 * diff;
-          const oy = dy * 0.5 * diff;
-          ct.p1.x += ox;
-          ct.p1.y += oy;
-          ct.p2.x -= ox;
-          ct.p2.y -= oy;
-        }
-      }
+      for (let j = 0; j < TOP_STIFFNESS; j++) relaxGroup(topConstraints);
+      for (let j = 0; j < BOTTOM_STIFFNESS; j++) relaxGroup(bottomConstraints);
+      for (let j = 0; j < CROSS_STIFFNESS; j++) relaxGroup(crossConstraints);
+      satisfyPins();
       for (const p of points) {
         if (p.pinned) continue;
         if (p.x < PAD) p.x = PAD;
@@ -728,6 +824,12 @@
     const { x, y } = canvasCoords(clientX, clientY);
     dragPoint = findNearest(x, y);
     if (!dragPoint) return;
+    // If the user grabs a pinned top-row node, the pin breaks immediately —
+    // they're physically pulling it, so there's no scenario where the pin
+    // should still hold it against the cursor.
+    for (const pin of pinAnchors) {
+      if (pin.p === dragPoint) { pin.broken = true; break; }
+    }
     dragPoint.pinned = true;
     dragTargetX = x;
     dragTargetY = y;
