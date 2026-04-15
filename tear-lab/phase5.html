@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Verlet Tear Lab — Phase 5: Stacked Fold Shadows</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #2a2a2a;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+    color: #bbb;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: normal;
+    margin: 0;
+    opacity: 0.7;
+    letter-spacing: 0.03em;
+  }
+  canvas {
+    background: #3a3a3a;
+    border: 1px solid #222;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<h1>Phase 5 — per-fold layer shadows (up to 3 stacked)</h1>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  // Offscreen buffer — we draw a layer of paper into it (no shadow), then
+  // blit that single image onto the main canvas with a shadow. Shadows in
+  // 2D canvas get applied per-subpath inside a single fill(), which bleeds
+  // onto interior quad edges; routing through a buffer shadows the silhouette
+  // only, which is what we want for a solid paper look.
+  const offCanvas = document.createElement('canvas');
+  offCanvas.width = W;
+  offCanvas.height = H;
+  const offCtx = offCanvas.getContext('2d');
+
+  class Point {
+    constructor(x, y, r, c) {
+      this.x = x;
+      this.y = y;
+      this.old_x = x;
+      this.old_y = y;
+      this.pinned = false;
+      this.fixed = false;
+      this.r = r;
+      this.c = c;
+    }
+  }
+
+  class Constraint {
+    constructor(p1, p2) {
+      this.p1 = p1;
+      this.p2 = p2;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      this.restLength = Math.hypot(dx, dy);
+      this.broken = false;
+    }
+  }
+
+  const COLS = 80;
+  const ROWS = 60;
+  const SPACING = 7;
+  const originX = (W - (COLS - 1) * SPACING) / 2;
+  const originY = 40;
+
+  const points = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const p = new Point(originX + c * SPACING, originY + r * SPACING, r, c);
+      if (r === 0) {
+        p.pinned = true;
+        p.fixed = true;
+      }
+      points.push(p);
+    }
+  }
+
+  const idx = (r, c) => r * COLS + c;
+
+  // Per-edge lookup so we can tell if a quad's four sides are all intact.
+  // hC[r][c] = horizontal constraint between (r,c) and (r,c+1)
+  // vC[r][c] = vertical constraint between (r,c) and (r+1,c)
+  const hC = Array.from({ length: ROWS }, () => new Array(COLS - 1));
+  const vC = Array.from({ length: ROWS - 1 }, () => new Array(COLS));
+  const constraints = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS - 1; c++) {
+      const ct = new Constraint(points[idx(r, c)], points[idx(r, c + 1)]);
+      hC[r][c] = ct;
+      constraints.push(ct);
+    }
+  }
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const ct = new Constraint(points[idx(r, c)], points[idx(r + 1, c)]);
+      vC[r][c] = ct;
+      constraints.push(ct);
+    }
+  }
+
+  const GRAVITY = 0.25;
+  const FRICTION = 0.99;
+  const ITERATIONS = 8;
+  const PAD = 2;
+  const STRETCH_LIMIT = 3;
+
+  // A quad is back-coloured only when its winding is flipped AND it belongs
+  // to a connected run of flipped quads this large — single flickering
+  // cells on a fold crease are suppressed.
+  const BACK_MIN_COMPONENT = 3;
+
+  // Hard cap on stacked shadow layers. Deeper folds clamp to the top layer.
+  const MAX_LAYER = 2;
+
+  const QROWS = ROWS - 1;
+  const QCOLS = COLS - 1;
+  const qIdx = (r, c) => r * QCOLS + c;
+
+  // Reusable per-frame buffers for the fold-detection + layering passes.
+  const flipped = new Uint8Array(QROWS * QCOLS);
+  const compId = new Int32Array(QROWS * QCOLS);
+  const isBack = new Uint8Array(QROWS * QCOLS);
+  const layerIdx = new Int32Array(QROWS * QCOLS);
+  const compSize = [];
+  const floodQueue = [];
+  const layerQueue = [];
+
+  function integrate() {
+    for (const p of points) {
+      if (p.pinned) continue;
+      const vx = (p.x - p.old_x) * FRICTION;
+      const vy = (p.y - p.old_y) * FRICTION;
+      p.old_x = p.x;
+      p.old_y = p.y;
+      p.x += vx;
+      p.y += vy + GRAVITY;
+    }
+  }
+
+  function satisfyConstraints() {
+    for (let i = 0; i < ITERATIONS; i++) {
+      for (const ct of constraints) {
+        if (ct.broken) continue;
+        const dx = ct.p2.x - ct.p1.x;
+        const dy = ct.p2.y - ct.p1.y;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+        if (dist > ct.restLength * STRETCH_LIMIT) {
+          ct.broken = true;
+          continue;
+        }
+        const diff = (dist - ct.restLength) / dist;
+        const p1Pinned = ct.p1.pinned;
+        const p2Pinned = ct.p2.pinned;
+        if (p1Pinned && p2Pinned) continue;
+        if (p1Pinned) {
+          ct.p2.x -= dx * diff;
+          ct.p2.y -= dy * diff;
+        } else if (p2Pinned) {
+          ct.p1.x += dx * diff;
+          ct.p1.y += dy * diff;
+        } else {
+          const ox = dx * 0.5 * diff;
+          const oy = dy * 0.5 * diff;
+          ct.p1.x += ox;
+          ct.p1.y += oy;
+          ct.p2.x -= ox;
+          ct.p2.y -= oy;
+        }
+      }
+      for (const p of points) {
+        if (p.pinned) continue;
+        if (p.x < PAD) p.x = PAD;
+        else if (p.x > W - PAD) p.x = W - PAD;
+        if (p.y < PAD) p.y = PAD;
+        else if (p.y > H - PAD) p.y = H - PAD;
+      }
+    }
+  }
+
+  // A quad is drawable when all four of its edges are still intact.
+  function quadAlive(r, c) {
+    return !hC[r][c].broken
+        && !hC[r + 1][c].broken
+        && !vC[r][c].broken
+        && !vC[r][c + 1].broken;
+  }
+
+  // Shoelace signed area for a quad in winding order (p00, p01, p11, p10).
+  // At rest the quad is wound clockwise in screen coords → positive.
+  // When the paper folds over itself the vertex order mirrors → negative,
+  // which is how we know we're looking at the back of the sheet.
+  function quadSignedArea(p00, p01, p11, p10) {
+    return 0.5 * (
+      (p00.x * p01.y - p01.x * p00.y) +
+      (p01.x * p11.y - p11.x * p01.y) +
+      (p11.x * p10.y - p10.x * p11.y) +
+      (p10.x * p00.y - p00.x * p10.y)
+    );
+  }
+
+  // Find connected runs of flipped quads (via intact shared edges) and
+  // only mark a cell as "back" if its component reaches BACK_MIN_COMPONENT.
+  // This suppresses the single-quad flicker along a fold crease while
+  // letting any real fold region (which is always several contiguous
+  // flipped cells) render as back-of-paper.
+  function computeBackFacing() {
+    flipped.fill(0);
+    compId.fill(-1);
+    isBack.fill(0);
+    compSize.length = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const p00 = points[idx(r, c)];
+        const p01 = points[idx(r, c + 1)];
+        const p11 = points[idx(r + 1, c + 1)];
+        const p10 = points[idx(r + 1, c)];
+        if (quadSignedArea(p00, p01, p11, p10) < 0) {
+          flipped[qIdx(r, c)] = 1;
+        }
+      }
+    }
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        const startI = qIdx(r, c);
+        if (!flipped[startI] || compId[startI] !== -1) continue;
+        const id = compSize.length;
+        compSize.push(1);
+        compId[startI] = id;
+        floodQueue.length = 0;
+        floodQueue.push(startI);
+        while (floodQueue.length) {
+          const curr = floodQueue.pop();
+          const rr = (curr / QCOLS) | 0;
+          const cc = curr - rr * QCOLS;
+          // Four neighbours connected iff the shared edge is still intact.
+          if (cc + 1 < QCOLS && !vC[rr][cc + 1].broken) {
+            const j = qIdx(rr, cc + 1);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (cc > 0 && !vC[rr][cc].broken) {
+            const j = qIdx(rr, cc - 1);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr + 1 < QROWS && !hC[rr + 1][cc].broken) {
+            const j = qIdx(rr + 1, cc);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr > 0 && !hC[rr][cc].broken) {
+            const j = qIdx(rr - 1, cc);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < flipped.length; i++) {
+      if (flipped[i] && compSize[compId[i]] >= BACK_MIN_COMPONENT) {
+        isBack[i] = 1;
+      }
+    }
+  }
+
+  // Assign each alive quad a stacking layer based on fold depth. BFS from
+  // the pinned top row (layer 0) along intact shared edges; crossing into
+  // a neighbour whose face-orientation differs increments the layer. Uses
+  // isBack (post-filter) not raw flipped so crease flicker doesn't spawn
+  // phantom layers. Torn-off fragments seed their own BFS at layer 0.
+  // Layer is clamped to MAX_LAYER so deeper folds reuse the top shadow.
+  // Returns the maximum layer actually seen this frame.
+  function computeLayers() {
+    layerIdx.fill(-1);
+    let maxSeen = 0;
+
+    // Seed from row 0 (pinned row is always the main sheet, layer 0).
+    for (let c = 0; c < QCOLS; c++) {
+      if (!quadAlive(0, c)) continue;
+      const i = qIdx(0, c);
+      layerIdx[i] = 0;
+      layerQueue.push(i);
+    }
+
+    const drain = () => {
+      while (layerQueue.length) {
+        const curr = layerQueue.shift();
+        const rr = (curr / QCOLS) | 0;
+        const cc = curr - rr * QCOLS;
+        const currLayer = layerIdx[curr];
+        const currBack = isBack[curr];
+
+        const tryVisit = (nr, nc, edgeOk) => {
+          if (!edgeOk) return;
+          if (nr < 0 || nr >= QROWS || nc < 0 || nc >= QCOLS) return;
+          if (!quadAlive(nr, nc)) return;
+          const j = qIdx(nr, nc);
+          if (layerIdx[j] !== -1) return;
+          const faceDiffers = isBack[j] !== currBack;
+          let nextLayer = currLayer + (faceDiffers ? 1 : 0);
+          if (nextLayer > MAX_LAYER) nextLayer = MAX_LAYER;
+          layerIdx[j] = nextLayer;
+          if (nextLayer > maxSeen) maxSeen = nextLayer;
+          layerQueue.push(j);
+        };
+
+        tryVisit(rr, cc + 1, cc + 1 < QCOLS && !vC[rr][cc + 1].broken);
+        tryVisit(rr, cc - 1, cc > 0 && !vC[rr][cc].broken);
+        tryVisit(rr + 1, cc, rr + 1 < QROWS && !hC[rr + 1][cc].broken);
+        tryVisit(rr - 1, cc, rr > 0 && !hC[rr][cc].broken);
+      }
+    };
+
+    drain();
+
+    // Any alive quad unreached by the row-0 BFS is a torn-off fragment;
+    // seed each such component at layer 0 locally.
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const i = qIdx(r, c);
+        if (layerIdx[i] !== -1) continue;
+        layerIdx[i] = 0;
+        layerQueue.push(i);
+        drain();
+      }
+    }
+
+    return maxSeen;
+  }
+
+  // Draw every alive quad matching `predicate` into the offscreen buffer,
+  // split into two paths (front / back) so folded-over cells can be tinted
+  // differently.
+  function drawQuadLayer(predicate) {
+    offCtx.clearRect(0, 0, W, H);
+    const frontPath = new Path2D();
+    const backPath = new Path2D();
+    let hasFront = false;
+    let hasBack = false;
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        if (!predicate(r, c)) continue;
+        const p00 = points[idx(r, c)];
+        const p01 = points[idx(r, c + 1)];
+        const p11 = points[idx(r + 1, c + 1)];
+        const p10 = points[idx(r + 1, c)];
+        const back = isBack[qIdx(r, c)];
+        const path = back ? backPath : frontPath;
+        path.moveTo(p00.x, p00.y);
+        path.lineTo(p01.x, p01.y);
+        path.lineTo(p11.x, p11.y);
+        path.lineTo(p10.x, p10.y);
+        path.closePath();
+        if (back) hasBack = true; else hasFront = true;
+      }
+    }
+    if (hasFront) {
+      offCtx.fillStyle = PAPER_FRONT;
+      offCtx.fill(frontPath);
+    }
+    if (hasBack) {
+      offCtx.fillStyle = PAPER_BACK;
+      offCtx.fill(backPath);
+    }
+    return hasFront || hasBack;
+  }
+
+  const PAPER_FRONT = '#f5efe4';
+  const PAPER_BACK = '#c9bc9f';
+
+  // Per-layer shadow ramp. Layer 0 is the base sheet against the canvas bg;
+  // each additional fold depth gets a heavier, more offset shadow so it
+  // reads as sitting further above the layer beneath it.
+  const LAYER_SHADOWS = [
+    { color: 'rgba(0,0,0,0.35)', blur: 10, offsetY: 4 },
+    { color: 'rgba(0,0,0,0.55)', blur: 18, offsetY: 10 },
+    { color: 'rgba(0,0,0,0.70)', blur: 26, offsetY: 16 },
+  ];
+
+  function blitLayer(shadow) {
+    ctx.save();
+    ctx.shadowColor = shadow.color;
+    ctx.shadowBlur = shadow.blur;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = shadow.offsetY;
+    ctx.drawImage(offCanvas, 0, 0);
+    ctx.restore();
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    computeBackFacing();
+    const maxLayer = computeLayers();
+
+    for (let L = 0; L <= maxLayer; L++) {
+      const predicate = (r, c) => layerIdx[qIdx(r, c)] === L;
+      if (drawQuadLayer(predicate)) {
+        blitLayer(LAYER_SHADOWS[Math.min(L, LAYER_SHADOWS.length - 1)]);
+      }
+    }
+
+    const drag = dragPoint;
+    if (drag) {
+      ctx.fillStyle = 'rgba(40, 140, 200, 0.8)';
+      ctx.beginPath();
+      ctx.arc(drag.x, drag.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // --- interaction ---
+  let dragPoint = null;
+
+  function findNearest(mx, my) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of points) {
+      const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  function canvasCoords(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (W / rect.width),
+      y: (clientY - rect.top) * (H / rect.height),
+    };
+  }
+
+  function startDrag(clientX, clientY) {
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint = findNearest(x, y);
+    if (!dragPoint) return;
+    dragPoint.pinned = true;
+    dragPoint.x = x;
+    dragPoint.y = y;
+    dragPoint.old_x = x;
+    dragPoint.old_y = y;
+    canvas.classList.add('dragging');
+  }
+
+  function moveDrag(clientX, clientY) {
+    if (!dragPoint) return;
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint.x = x;
+    dragPoint.y = y;
+  }
+
+  function endDrag() {
+    if (dragPoint && !dragPoint.fixed) {
+      dragPoint.pinned = false;
+      dragPoint.old_x = dragPoint.x;
+      dragPoint.old_y = dragPoint.y;
+    }
+    dragPoint = null;
+    canvas.classList.remove('dragging');
+  }
+
+  canvas.addEventListener('mousedown', e => startDrag(e.clientX, e.clientY));
+  window.addEventListener('mousemove', e => moveDrag(e.clientX, e.clientY));
+  window.addEventListener('mouseup', endDrag);
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    startDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    moveDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    endDrag();
+  }, { passive: false });
+
+  function loop() {
+    integrate();
+    satisfyConstraints();
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
+</script>
+</body>
+</html>
