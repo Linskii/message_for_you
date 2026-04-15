@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Verlet Tear Lab — Phase 6: Letter Opening</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #2a2a2a;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+    color: #bbb;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: normal;
+    margin: 0;
+    opacity: 0.7;
+    letter-spacing: 0.03em;
+  }
+  canvas {
+    background: #2f2f2f;
+    border: 1px solid #222;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<h1>Phase 6 — letter opening: precomputed jagged tear path, edge-seeded propagation</h1>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const offCanvas = document.createElement('canvas');
+  offCanvas.width = W;
+  offCanvas.height = H;
+  const offCtx = offCanvas.getContext('2d');
+
+  class Point {
+    constructor(x, y, r, c) {
+      this.x = x;
+      this.y = y;
+      this.old_x = x;
+      this.old_y = y;
+      this.pinned = false;
+      this.fixed = false;
+      this.r = r;
+      this.c = c;
+    }
+  }
+
+  class Constraint {
+    constructor(p1, p2) {
+      this.p1 = p1;
+      this.p2 = p2;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      this.restLength = Math.hypot(dx, dy);
+      this.broken = false;
+      this.tearable = false;
+      this.pathIndex = -1;
+    }
+  }
+
+  // Same 4800 nodes as phase 5, but packed into a thin letter-flap strip.
+  // Only the strip is simulated; a static pseudo-letter is rendered beneath.
+  const COLS = 160;
+  const ROWS = 30;
+  const SPACING = 3.5;
+  const stripW = (COLS - 1) * SPACING;
+  const stripH = (ROWS - 1) * SPACING;
+  const originX = (W - stripW) / 2;
+  const originY = 60;
+
+  const points = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const p = new Point(originX + c * SPACING, originY + r * SPACING, r, c);
+      // Only the bottom row is pinned (attached to the letter body). The top
+      // strip hangs free so it can flop away as the tear propagates.
+      if (r === ROWS - 1) {
+        p.pinned = true;
+        p.fixed = true;
+      }
+      points.push(p);
+    }
+  }
+
+  const idx = (r, c) => r * COLS + c;
+
+  const hC = Array.from({ length: ROWS }, () => new Array(COLS - 1));
+  const vC = Array.from({ length: ROWS - 1 }, () => new Array(COLS));
+  const constraints = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS - 1; c++) {
+      const ct = new Constraint(points[idx(r, c)], points[idx(r, c + 1)]);
+      hC[r][c] = ct;
+      constraints.push(ct);
+    }
+  }
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const ct = new Constraint(points[idx(r, c)], points[idx(r + 1, c)]);
+      vC[r][c] = ct;
+      constraints.push(ct);
+    }
+  }
+
+  // Precomputed jagged tear path, left-to-right across the strip. Only edges
+  // crossed by this path are `tearable`; all others never break. Path is
+  // stored in left-to-right order so each edge knows its neighbours along
+  // the tear — needed for the edge-seeded propagation rule.
+  //
+  // pathRowAt[c] = path runs between rows pathRowAt[c] and pathRowAt[c]+1
+  // at column c (so it crosses the vertical constraint vC[pathRowAt[c]][c]).
+  // Row transitions between columns cross horizontal constraints.
+  const TEAR_MIN_ROW = Math.floor(ROWS * 0.40);
+  const TEAR_MAX_ROW = Math.floor(ROWS * 0.65);
+  const pathRowAt = new Int32Array(COLS);
+  {
+    let r = TEAR_MIN_ROW + Math.floor(Math.random() * (TEAR_MAX_ROW - TEAR_MIN_ROW + 1));
+    pathRowAt[0] = r;
+    for (let c = 1; c < COLS; c++) {
+      const roll = Math.random();
+      let step = 0;
+      if (roll < 0.18) step = -1;
+      else if (roll < 0.36) step = 1;
+      if (Math.random() < 0.08) step *= 2;
+      r += step;
+      if (r < TEAR_MIN_ROW) r = TEAR_MIN_ROW;
+      if (r > TEAR_MAX_ROW) r = TEAR_MAX_ROW;
+      pathRowAt[c] = r;
+    }
+  }
+
+  const tearPath = [];
+  for (let c = 0; c < COLS; c++) {
+    const vEdge = vC[pathRowAt[c]][c];
+    vEdge.tearable = true;
+    vEdge.pathIndex = tearPath.length;
+    tearPath.push(vEdge);
+
+    if (c < COLS - 1) {
+      const y0 = pathRowAt[c];
+      const y1 = pathRowAt[c + 1];
+      if (y1 > y0) {
+        for (let rr = y0 + 1; rr <= y1; rr++) {
+          const hEdge = hC[rr][c];
+          hEdge.tearable = true;
+          hEdge.pathIndex = tearPath.length;
+          tearPath.push(hEdge);
+        }
+      } else if (y1 < y0) {
+        for (let rr = y0; rr >= y1 + 1; rr--) {
+          const hEdge = hC[rr][c];
+          hEdge.tearable = true;
+          hEdge.pathIndex = tearPath.length;
+          tearPath.push(hEdge);
+        }
+      }
+    }
+  }
+  const tearPathLen = tearPath.length;
+
+  // Paper is much stiffer than phase 5 (STRETCH_LIMIT was 3). A tearable
+  // edge only breaks if it's a path endpoint (at the paper's left/right
+  // boundary) OR a tear-path neighbour has already broken — so tears can
+  // only propagate inward from the sides.
+  const GRAVITY = 0.0;
+  const FRICTION = 0.95;
+  const ITERATIONS = 15;
+  const PAD = 2;
+  const STRETCH_LIMIT = 1.15;
+
+  const BACK_MIN_COMPONENT = 3;
+  const MAX_LAYER = 2;
+  const LAYER_MIN_COMPONENT = 3;
+
+  const QROWS = ROWS - 1;
+  const QCOLS = COLS - 1;
+  const qIdx = (r, c) => r * QCOLS + c;
+
+  const flipped = new Uint8Array(QROWS * QCOLS);
+  const compId = new Int32Array(QROWS * QCOLS);
+  const isBack = new Uint8Array(QROWS * QCOLS);
+  const layerIdx = new Int32Array(QROWS * QCOLS);
+  const layerCompId = new Int32Array(QROWS * QCOLS);
+  const layerCompSize = [];
+  const layerCompNewLayer = new Int32Array(QROWS * QCOLS);
+  const layerCompNeighborCounts = new Int32Array(QROWS * QCOLS * (MAX_LAYER + 1));
+  const compSize = [];
+  const floodQueue = [];
+  const layerQueue = [];
+
+  function integrate() {
+    for (const p of points) {
+      if (p.pinned) continue;
+      const vx = (p.x - p.old_x) * FRICTION;
+      const vy = (p.y - p.old_y) * FRICTION;
+      p.old_x = p.x;
+      p.old_y = p.y;
+      p.x += vx;
+      p.y += vy + GRAVITY;
+    }
+  }
+
+  // Pulls the dragged point toward the mouse target, but never further than
+  // STRETCH_LIMIT * rest from each intact neighbor. Called every constraint
+  // iteration so stress propagates along the chain — without this the pinned
+  // drag point's neighbor snaps all the way to it in iteration 1, then the
+  // next neighbor snaps in iteration 2, and the whole mesh teleports to the
+  // cursor in ITERATIONS frames regardless of stretch limits.
+  function clampDragPoint() {
+    if (!dragPoint) return;
+    let tx = dragTargetX;
+    let ty = dragTargetY;
+    const r = dragPoint.r;
+    const c = dragPoint.c;
+    const maxD = SPACING * STRETCH_LIMIT;
+    const clampTo = (n) => {
+      const ddx = tx - n.x;
+      const ddy = ty - n.y;
+      const d = Math.hypot(ddx, ddy);
+      if (d > maxD) {
+        tx = n.x + ddx * maxD / d;
+        ty = n.y + ddy * maxD / d;
+      }
+    };
+    if (r > 0 && !vC[r - 1][c].broken) clampTo(points[idx(r - 1, c)]);
+    if (r < ROWS - 1 && !vC[r][c].broken) clampTo(points[idx(r + 1, c)]);
+    if (c > 0 && !hC[r][c - 1].broken) clampTo(points[idx(r, c - 1)]);
+    if (c < COLS - 1 && !hC[r][c].broken) clampTo(points[idx(r, c + 1)]);
+    dragPoint.x = tx;
+    dragPoint.y = ty;
+    dragPoint.old_x = tx;
+    dragPoint.old_y = ty;
+  }
+
+  function satisfyConstraints() {
+    for (let i = 0; i < ITERATIONS; i++) {
+      clampDragPoint();
+      for (const ct of constraints) {
+        if (ct.broken) continue;
+        const dx = ct.p2.x - ct.p1.x;
+        const dy = ct.p2.y - ct.p1.y;
+        const dist = Math.hypot(dx, dy) || 0.0001;
+
+        if (ct.tearable && dist > ct.restLength * STRETCH_LIMIT) {
+          const pi = ct.pathIndex;
+          const isEndpoint = (pi === 0 || pi === tearPathLen - 1);
+          const prevBroken = pi > 0 && tearPath[pi - 1].broken;
+          const nextBroken = pi < tearPathLen - 1 && tearPath[pi + 1].broken;
+          if (isEndpoint || prevBroken || nextBroken) {
+            ct.broken = true;
+            continue;
+          }
+          // Can't break yet — fall through to relax hard.
+        }
+
+        const diff = (dist - ct.restLength) / dist;
+        const p1Pinned = ct.p1.pinned;
+        const p2Pinned = ct.p2.pinned;
+        if (p1Pinned && p2Pinned) continue;
+        if (p1Pinned) {
+          ct.p2.x -= dx * diff;
+          ct.p2.y -= dy * diff;
+        } else if (p2Pinned) {
+          ct.p1.x += dx * diff;
+          ct.p1.y += dy * diff;
+        } else {
+          const ox = dx * 0.5 * diff;
+          const oy = dy * 0.5 * diff;
+          ct.p1.x += ox;
+          ct.p1.y += oy;
+          ct.p2.x -= ox;
+          ct.p2.y -= oy;
+        }
+      }
+      for (const p of points) {
+        if (p.pinned) continue;
+        if (p.x < PAD) p.x = PAD;
+        else if (p.x > W - PAD) p.x = W - PAD;
+        if (p.y < PAD) p.y = PAD;
+        else if (p.y > H - PAD) p.y = H - PAD;
+      }
+    }
+  }
+
+  function quadAlive(r, c) {
+    return !hC[r][c].broken
+        && !hC[r + 1][c].broken
+        && !vC[r][c].broken
+        && !vC[r][c + 1].broken;
+  }
+
+  function quadSignedArea(p00, p01, p11, p10) {
+    return 0.5 * (
+      (p00.x * p01.y - p01.x * p00.y) +
+      (p01.x * p11.y - p11.x * p01.y) +
+      (p11.x * p10.y - p10.x * p11.y) +
+      (p10.x * p00.y - p00.x * p10.y)
+    );
+  }
+
+  function computeBackFacing() {
+    flipped.fill(0);
+    compId.fill(-1);
+    isBack.fill(0);
+    compSize.length = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const p00 = points[idx(r, c)];
+        const p01 = points[idx(r, c + 1)];
+        const p11 = points[idx(r + 1, c + 1)];
+        const p10 = points[idx(r + 1, c)];
+        if (quadSignedArea(p00, p01, p11, p10) < 0) {
+          flipped[qIdx(r, c)] = 1;
+        }
+      }
+    }
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        const startI = qIdx(r, c);
+        if (!flipped[startI] || compId[startI] !== -1) continue;
+        const id = compSize.length;
+        compSize.push(1);
+        compId[startI] = id;
+        floodQueue.length = 0;
+        floodQueue.push(startI);
+        while (floodQueue.length) {
+          const curr = floodQueue.pop();
+          const rr = (curr / QCOLS) | 0;
+          const cc = curr - rr * QCOLS;
+          if (cc + 1 < QCOLS && !vC[rr][cc + 1].broken) {
+            const j = qIdx(rr, cc + 1);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (cc > 0 && !vC[rr][cc].broken) {
+            const j = qIdx(rr, cc - 1);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr + 1 < QROWS && !hC[rr + 1][cc].broken) {
+            const j = qIdx(rr + 1, cc);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr > 0 && !hC[rr][cc].broken) {
+            const j = qIdx(rr - 1, cc);
+            if (flipped[j] && compId[j] === -1) {
+              compId[j] = id; compSize[id]++; floodQueue.push(j);
+            }
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < flipped.length; i++) {
+      if (flipped[i] && compSize[compId[i]] >= BACK_MIN_COMPONENT) {
+        isBack[i] = 1;
+      }
+    }
+  }
+
+  // Seeds BFS from BOTH pinned rows (top grip + bottom attached to letter).
+  // After the strip tears, the top-half and bottom-half components each have
+  // their own pinned row seeding them at layer 0 — no "torn-off fragment"
+  // fallback needed for the intact halves.
+  function computeLayers() {
+    layerIdx.fill(-1);
+    let maxSeen = 0;
+
+    for (let c = 0; c < QCOLS; c++) {
+      if (quadAlive(0, c)) {
+        const i = qIdx(0, c);
+        layerIdx[i] = 0;
+        layerQueue.push(i);
+      }
+    }
+    for (let c = 0; c < QCOLS; c++) {
+      if (quadAlive(QROWS - 1, c)) {
+        const i = qIdx(QROWS - 1, c);
+        if (layerIdx[i] === -1) {
+          layerIdx[i] = 0;
+          layerQueue.push(i);
+        }
+      }
+    }
+
+    const drain = () => {
+      while (layerQueue.length) {
+        const curr = layerQueue.shift();
+        const rr = (curr / QCOLS) | 0;
+        const cc = curr - rr * QCOLS;
+        const currLayer = layerIdx[curr];
+        const currBack = isBack[curr];
+
+        const tryVisit = (nr, nc, edgeOk) => {
+          if (!edgeOk) return;
+          if (nr < 0 || nr >= QROWS || nc < 0 || nc >= QCOLS) return;
+          if (!quadAlive(nr, nc)) return;
+          const j = qIdx(nr, nc);
+          if (layerIdx[j] !== -1) return;
+          const faceDiffers = isBack[j] !== currBack;
+          let nextLayer = currLayer + (faceDiffers ? 1 : 0);
+          if (nextLayer > MAX_LAYER) nextLayer = MAX_LAYER;
+          layerIdx[j] = nextLayer;
+          if (nextLayer > maxSeen) maxSeen = nextLayer;
+          layerQueue.push(j);
+        };
+
+        tryVisit(rr, cc + 1, cc + 1 < QCOLS && !vC[rr][cc + 1].broken);
+        tryVisit(rr, cc - 1, cc > 0 && !vC[rr][cc].broken);
+        tryVisit(rr + 1, cc, rr + 1 < QROWS && !hC[rr + 1][cc].broken);
+        tryVisit(rr - 1, cc, rr > 0 && !hC[rr][cc].broken);
+      }
+    };
+
+    drain();
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const i = qIdx(r, c);
+        if (layerIdx[i] !== -1) continue;
+        layerIdx[i] = 0;
+        layerQueue.push(i);
+        drain();
+      }
+    }
+
+    return maxSeen;
+  }
+
+  function filterLayerSpeckle() {
+    layerCompId.fill(-1);
+    layerCompSize.length = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const startI = qIdx(r, c);
+        if (layerCompId[startI] !== -1) continue;
+        const id = layerCompSize.length;
+        const L = layerIdx[startI];
+        layerCompId[startI] = id;
+        layerCompSize.push(1);
+        floodQueue.length = 0;
+        floodQueue.push(startI);
+        while (floodQueue.length) {
+          const curr = floodQueue.pop();
+          const rr = (curr / QCOLS) | 0;
+          const cc = curr - rr * QCOLS;
+          if (cc + 1 < QCOLS && !vC[rr][cc + 1].broken) {
+            const j = qIdx(rr, cc + 1);
+            if (quadAlive(rr, cc + 1) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (cc > 0 && !vC[rr][cc].broken) {
+            const j = qIdx(rr, cc - 1);
+            if (quadAlive(rr, cc - 1) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr + 1 < QROWS && !hC[rr + 1][cc].broken) {
+            const j = qIdx(rr + 1, cc);
+            if (quadAlive(rr + 1, cc) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr > 0 && !hC[rr][cc].broken) {
+            const j = qIdx(rr - 1, cc);
+            if (quadAlive(rr - 1, cc) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+        }
+      }
+    }
+
+    const stride = MAX_LAYER + 1;
+    const numComps = layerCompSize.length;
+    for (let k = 0; k < numComps * stride; k++) layerCompNeighborCounts[k] = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const i = qIdx(r, c);
+        const id = layerCompId[i];
+        if (layerCompSize[id] >= LAYER_MIN_COMPONENT) continue;
+        const base = id * stride;
+        if (c + 1 < QCOLS && !vC[r][c + 1].broken && quadAlive(r, c + 1)) {
+          const j = qIdx(r, c + 1);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+        if (c > 0 && !vC[r][c].broken && quadAlive(r, c - 1)) {
+          const j = qIdx(r, c - 1);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+        if (r + 1 < QROWS && !hC[r + 1][c].broken && quadAlive(r + 1, c)) {
+          const j = qIdx(r + 1, c);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+        if (r > 0 && !hC[r][c].broken && quadAlive(r - 1, c)) {
+          const j = qIdx(r - 1, c);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+      }
+    }
+
+    for (let id = 0; id < numComps; id++) {
+      layerCompNewLayer[id] = -1;
+      if (layerCompSize[id] >= LAYER_MIN_COMPONENT) continue;
+      const base = id * stride;
+      let bestL = -1, bestCount = 0;
+      for (let k = 0; k < stride; k++) {
+        const ct = layerCompNeighborCounts[base + k];
+        if (ct > bestCount) { bestCount = ct; bestL = k; }
+      }
+      layerCompNewLayer[id] = bestL;
+    }
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const i = qIdx(r, c);
+        const newL = layerCompNewLayer[layerCompId[i]];
+        if (newL !== -1) layerIdx[i] = newL;
+      }
+    }
+  }
+
+  const PAPER_FRONT = '#f5efe4';
+  const PAPER_BACK = '#c9bc9f';
+
+  function drawQuadLayer(predicate) {
+    offCtx.clearRect(0, 0, W, H);
+    const frontPath = new Path2D();
+    const backPath = new Path2D();
+    let hasFront = false;
+    let hasBack = false;
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        if (!predicate(r, c)) continue;
+        const p00 = points[idx(r, c)];
+        const p01 = points[idx(r, c + 1)];
+        const p11 = points[idx(r + 1, c + 1)];
+        const p10 = points[idx(r + 1, c)];
+        const back = isBack[qIdx(r, c)];
+        const path = back ? backPath : frontPath;
+        path.moveTo(p00.x, p00.y);
+        path.lineTo(p01.x, p01.y);
+        path.lineTo(p11.x, p11.y);
+        path.lineTo(p10.x, p10.y);
+        path.closePath();
+        if (back) hasBack = true; else hasFront = true;
+      }
+    }
+    if (hasFront) {
+      offCtx.fillStyle = PAPER_FRONT;
+      offCtx.fill(frontPath);
+    }
+    if (hasBack) {
+      offCtx.fillStyle = PAPER_BACK;
+      offCtx.fill(backPath);
+    }
+    return hasFront || hasBack;
+  }
+
+  const LAYER_SHADOWS = [
+    { color: 'rgba(0,0,0,0.35)', blur: 10, offsetY: 4 },
+    { color: 'rgba(0,0,0,0.55)', blur: 16, offsetY: 9 },
+    { color: 'rgba(0,0,0,0.70)', blur: 22, offsetY: 14 },
+  ];
+
+  function blitLayer(shadow) {
+    ctx.save();
+    ctx.shadowColor = shadow.color;
+    ctx.shadowBlur = shadow.blur;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = shadow.offsetY;
+    ctx.drawImage(offCanvas, 0, 0);
+    ctx.restore();
+  }
+
+  // Static letter body below the strip — visual only, no physics. Sits flush
+  // with the bottom row of the strip so they read as one continuous sheet
+  // until the strip tears open.
+  const letterBodyX = originX;
+  const letterBodyY = originY + stripH;
+  const letterBodyW = stripW;
+  const letterBodyH = H - letterBodyY - 40;
+  const textLineGap = 15;
+  const textLineLefts = [];
+  const textLineWidths = [];
+  {
+    const usableH = letterBodyH - 36;
+    const numLines = Math.floor(usableH / textLineGap);
+    for (let i = 0; i < numLines; i++) {
+      textLineLefts.push(20 + Math.random() * 10);
+      textLineWidths.push(0.55 + Math.random() * 0.4);
+    }
+  }
+
+  function drawLetterBody() {
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 16;
+    ctx.shadowOffsetY = 8;
+    ctx.fillStyle = PAPER_FRONT;
+    ctx.fillRect(letterBodyX, letterBodyY, letterBodyW, letterBodyH);
+    ctx.restore();
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(55, 45, 35, 0.32)';
+    ctx.lineWidth = 1.4;
+    for (let i = 0; i < textLineLefts.length; i++) {
+      const y = letterBodyY + 22 + i * textLineGap;
+      if (y > letterBodyY + letterBodyH - 16) break;
+      const left = letterBodyX + textLineLefts[i];
+      const right = left + textLineWidths[i] * (letterBodyW - textLineLefts[i] - 25);
+      ctx.beginPath();
+      ctx.moveTo(left, y);
+      ctx.lineTo(right, y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Faint dashed line following unbroken tear-path edge midpoints, so the
+  // perforation deforms with the paper and disappears where it's torn.
+  function drawPerforations() {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(50, 40, 30, 0.45)';
+    ctx.lineWidth = 0.9;
+    ctx.setLineDash([2, 2.5]);
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < tearPathLen; i++) {
+      const ct = tearPath[i];
+      if (ct.broken) { started = false; continue; }
+      const mx = (ct.p1.x + ct.p2.x) * 0.5;
+      const my = (ct.p1.y + ct.p2.y) * 0.5;
+      if (!started) { ctx.moveTo(mx, my); started = true; }
+      else ctx.lineTo(mx, my);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    drawLetterBody();
+
+    computeBackFacing();
+    const maxLayer = computeLayers();
+    filterLayerSpeckle();
+
+    for (let L = 0; L <= maxLayer; L++) {
+      const predicate = (r, c) => layerIdx[qIdx(r, c)] >= L;
+      if (drawQuadLayer(predicate)) {
+        blitLayer(LAYER_SHADOWS[Math.min(L, LAYER_SHADOWS.length - 1)]);
+      }
+    }
+
+    drawPerforations();
+
+    const drag = dragPoint;
+    if (drag) {
+      ctx.fillStyle = 'rgba(40, 140, 200, 0.8)';
+      ctx.beginPath();
+      ctx.arc(drag.x, drag.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  let dragPoint = null;
+  let dragTargetX = 0;
+  let dragTargetY = 0;
+
+  function findNearest(mx, my) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of points) {
+      const d = (p.x - mx) ** 2 + (p.y - my) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = p;
+      }
+    }
+    return best;
+  }
+
+  function canvasCoords(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (W / rect.width),
+      y: (clientY - rect.top) * (H / rect.height),
+    };
+  }
+
+  function startDrag(clientX, clientY) {
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragPoint = findNearest(x, y);
+    if (!dragPoint) return;
+    dragPoint.pinned = true;
+    dragTargetX = x;
+    dragTargetY = y;
+    canvas.classList.add('dragging');
+  }
+
+  function moveDrag(clientX, clientY) {
+    if (!dragPoint) return;
+    const { x, y } = canvasCoords(clientX, clientY);
+    dragTargetX = x;
+    dragTargetY = y;
+  }
+
+  function endDrag() {
+    if (dragPoint && !dragPoint.fixed) {
+      dragPoint.pinned = false;
+      dragPoint.old_x = dragPoint.x;
+      dragPoint.old_y = dragPoint.y;
+    }
+    dragPoint = null;
+    canvas.classList.remove('dragging');
+  }
+
+  canvas.addEventListener('mousedown', e => startDrag(e.clientX, e.clientY));
+  window.addEventListener('mousemove', e => moveDrag(e.clientX, e.clientY));
+  window.addEventListener('mouseup', endDrag);
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    startDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    const t = e.touches[0];
+    moveDrag(t.clientX, t.clientY);
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    endDrag();
+  }, { passive: false });
+
+  function loop() {
+    integrate();
+    satisfyConstraints();
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
+</script>
+</body>
+</html>
