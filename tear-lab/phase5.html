@@ -136,6 +136,12 @@
   // Hard cap on stacked shadow layers. Deeper folds clamp to the top layer.
   const MAX_LAYER = 2;
 
+  // Connected components of equal layerIdx smaller than this get absorbed
+  // into their surroundings. Without it, a single mis-flipped quad can bump
+  // the layer BFS into a lone layer-N+1 speck whose tiny silhouette carries
+  // its own shadow outline, visible as a bright hairline inside a fold.
+  const LAYER_MIN_COMPONENT = 3;
+
   const QROWS = ROWS - 1;
   const QCOLS = COLS - 1;
   const qIdx = (r, c) => r * QCOLS + c;
@@ -145,6 +151,11 @@
   const compId = new Int32Array(QROWS * QCOLS);
   const isBack = new Uint8Array(QROWS * QCOLS);
   const layerIdx = new Int32Array(QROWS * QCOLS);
+  const layerCompId = new Int32Array(QROWS * QCOLS);
+  const layerCompSize = [];
+  const layerCompNewLayer = new Int32Array(QROWS * QCOLS);
+  // Flat per-component histogram keyed by compId*(MAX_LAYER+1)+L.
+  const layerCompNeighborCounts = new Int32Array(QROWS * QCOLS * (MAX_LAYER + 1));
   const compSize = [];
   const floodQueue = [];
   const layerQueue = [];
@@ -361,6 +372,113 @@
     return maxSeen;
   }
 
+  // Suppress tiny layer islands. Flood-fill connected components of equal
+  // layerIdx across intact shared edges; for any component smaller than
+  // LAYER_MIN_COMPONENT, tally the layer values of its boundary neighbours
+  // and reassign every cell in the component to the mode. Decided per
+  // component (not per cell) so a 2-cell speck can't split between two new
+  // layers. Runs on a snapshot implicitly: we only read layerIdx values from
+  // cells in *other* components, so reassigning small components mid-pass
+  // can't feed back into its own mode calculation.
+  function filterLayerSpeckle() {
+    layerCompId.fill(-1);
+    layerCompSize.length = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const startI = qIdx(r, c);
+        if (layerCompId[startI] !== -1) continue;
+        const id = layerCompSize.length;
+        const L = layerIdx[startI];
+        layerCompId[startI] = id;
+        layerCompSize.push(1);
+        floodQueue.length = 0;
+        floodQueue.push(startI);
+        while (floodQueue.length) {
+          const curr = floodQueue.pop();
+          const rr = (curr / QCOLS) | 0;
+          const cc = curr - rr * QCOLS;
+          if (cc + 1 < QCOLS && !vC[rr][cc + 1].broken) {
+            const j = qIdx(rr, cc + 1);
+            if (quadAlive(rr, cc + 1) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (cc > 0 && !vC[rr][cc].broken) {
+            const j = qIdx(rr, cc - 1);
+            if (quadAlive(rr, cc - 1) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr + 1 < QROWS && !hC[rr + 1][cc].broken) {
+            const j = qIdx(rr + 1, cc);
+            if (quadAlive(rr + 1, cc) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+          if (rr > 0 && !hC[rr][cc].broken) {
+            const j = qIdx(rr - 1, cc);
+            if (quadAlive(rr - 1, cc) && layerCompId[j] === -1 && layerIdx[j] === L) {
+              layerCompId[j] = id; layerCompSize[id]++; floodQueue.push(j);
+            }
+          }
+        }
+      }
+    }
+
+    const stride = MAX_LAYER + 1;
+    const numComps = layerCompSize.length;
+    for (let k = 0; k < numComps * stride; k++) layerCompNeighborCounts[k] = 0;
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const i = qIdx(r, c);
+        const id = layerCompId[i];
+        if (layerCompSize[id] >= LAYER_MIN_COMPONENT) continue;
+        const base = id * stride;
+        if (c + 1 < QCOLS && !vC[r][c + 1].broken && quadAlive(r, c + 1)) {
+          const j = qIdx(r, c + 1);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+        if (c > 0 && !vC[r][c].broken && quadAlive(r, c - 1)) {
+          const j = qIdx(r, c - 1);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+        if (r + 1 < QROWS && !hC[r + 1][c].broken && quadAlive(r + 1, c)) {
+          const j = qIdx(r + 1, c);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+        if (r > 0 && !hC[r][c].broken && quadAlive(r - 1, c)) {
+          const j = qIdx(r - 1, c);
+          if (layerCompId[j] !== id) layerCompNeighborCounts[base + layerIdx[j]]++;
+        }
+      }
+    }
+
+    for (let id = 0; id < numComps; id++) {
+      layerCompNewLayer[id] = -1;
+      if (layerCompSize[id] >= LAYER_MIN_COMPONENT) continue;
+      const base = id * stride;
+      let bestL = -1, bestCount = 0;
+      for (let k = 0; k < stride; k++) {
+        const ct = layerCompNeighborCounts[base + k];
+        if (ct > bestCount) { bestCount = ct; bestL = k; }
+      }
+      layerCompNewLayer[id] = bestL;
+    }
+
+    for (let r = 0; r < QROWS; r++) {
+      for (let c = 0; c < QCOLS; c++) {
+        if (!quadAlive(r, c)) continue;
+        const i = qIdx(r, c);
+        const newL = layerCompNewLayer[layerCompId[i]];
+        if (newL !== -1) layerIdx[i] = newL;
+      }
+    }
+  }
+
   // Draw every alive quad matching `predicate` into the offscreen buffer,
   // split into two paths (front / back) so folded-over cells can be tinted
   // differently.
@@ -425,9 +543,16 @@
     ctx.clearRect(0, 0, W, H);
     computeBackFacing();
     const maxLayer = computeLayers();
+    filterLayerSpeckle();
 
+    // Each pass draws all quads at layer >= L (not === L). The silhouette
+    // cast by drawImage is then the outline of "this fold and everything
+    // above it" — i.e. only real paper edges — so no shadow is drawn along
+    // the seam where a lower layer butts up against a higher one. Passes go
+    // back-to-front; overdraw on upper layers is harmless because the colour
+    // is the same on both passes and the later shadow is the one we want.
     for (let L = 0; L <= maxLayer; L++) {
-      const predicate = (r, c) => layerIdx[qIdx(r, c)] === L;
+      const predicate = (r, c) => layerIdx[qIdx(r, c)] >= L;
       if (drawQuadLayer(predicate)) {
         blitLayer(LAYER_SHADOWS[Math.min(L, LAYER_SHADOWS.length - 1)]);
       }
