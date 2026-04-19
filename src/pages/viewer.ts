@@ -44,12 +44,17 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
     }
   }
 
-  // ── build DOM — canvas only, no letter yet ───────────────────────────────────
+  // ── build DOM — letter already mounted behind canvas for a seamless reveal ──
   injectStyles()
 
   root.innerHTML = `
     <div class="viewer">
       <div class="viewer__stage" id="stage">
+        <div class="viewer__letter" id="letter">
+          <div class="letter__paper">
+            <p class="letter__text">${escapeHtml(plaintext)}</p>
+          </div>
+        </div>
         <canvas class="viewer__canvas" id="tear-canvas"></canvas>
       </div>
     </div>
@@ -57,6 +62,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
 
   const canvas = document.getElementById('tear-canvas') as HTMLCanvasElement
   const stage = document.getElementById('stage') as HTMLDivElement
+  const letter = document.getElementById('letter') as HTMLDivElement
 
   requestAnimationFrame(() => {
     canvas.width = stage.clientWidth || 480
@@ -66,14 +72,10 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
       coverUrl,
       jagStyle: template?.jagStyle ?? 'light',
       onRevealed: () => {
-        // Replace canvas with the letter
-        stage.innerHTML = `
-          <div class="viewer__letter">
-            <div class="letter__paper">
-              <p class="letter__text">${escapeHtml(plaintext)}</p>
-            </div>
-          </div>
-        `
+        // Canvas has slid its content off-screen; remove it and let the
+        // already-mounted letter breathe with a gentle fade-up.
+        canvas.remove()
+        letter.classList.add('viewer__letter--revealed')
       },
     })
 
@@ -103,7 +105,7 @@ function escapeHtml(s: string): string {
 
 function injectStyles(): void {
   const existing = document.getElementById('viewer-styles')
-  if (existing) existing.remove() // always refresh styles
+  if (existing) existing.remove()
   const style = document.createElement('style')
   style.id = 'viewer-styles'
   style.textContent = `
@@ -131,16 +133,19 @@ function injectStyles(): void {
       border-radius: 4px;
       overflow: hidden;
       box-shadow: 0 8px 40px rgba(0,0,0,0.12);
-      cursor: crosshair;
-      background: #fff;
+      cursor: grab;
+      background: var(--bg);
     }
+    .viewer__stage:active { cursor: grabbing; }
 
     .viewer__canvas {
+      position: absolute;
+      inset: 0;
       display: block;
       width: 100%;
       height: 100%;
       touch-action: none;
-      background: #fff;
+      z-index: 2;
     }
 
     .viewer__letter {
@@ -152,7 +157,14 @@ function injectStyles(): void {
       background: var(--bg);
       padding: 2rem;
       overflow-y: auto;
-      animation: letterReveal 0.4s ease both;
+      opacity: 0.0;
+      transform: translateY(6px);
+      transition: opacity 0.5s ease 0.05s, transform 0.5s ease 0.05s;
+      z-index: 1;
+    }
+    .viewer__letter--revealed {
+      opacity: 1;
+      transform: translateY(0);
     }
 
     .letter__paper {
@@ -162,11 +174,6 @@ function injectStyles(): void {
       padding: 2.5rem 3rem;
       max-width: 100%;
       box-shadow: 0 2px 16px rgba(0,0,0,0.06);
-    }
-
-    @keyframes letterReveal {
-      from { opacity: 0; transform: translateY(12px); }
-      to   { opacity: 1; transform: translateY(0); }
     }
 
     .letter__text {
