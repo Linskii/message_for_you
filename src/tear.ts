@@ -59,6 +59,27 @@ class AudioManager {
   private isRipping = false
   private lastAboveThresholdMs = 0
 
+  // Raw AAC bytes, prefetched on construction (before any user gesture) so
+  // that on mobile the slow network + small CPU doesn't cause the first rip
+  // to finish before buffers are ready. decodeAudioData still runs once the
+  // AudioContext exists, but that part is fast on pre-downloaded bytes.
+  private prefetched: Promise<(ArrayBuffer | null)[]>
+
+  constructor() {
+    this.prefetched = Promise.all(
+      AUDIO_FILES.map(async (url) => {
+        try {
+          const res = await fetch(url)
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          return await res.arrayBuffer()
+        } catch (e) {
+          console.warn(`Audio: prefetch failed for "${url}":`, e)
+          return null
+        }
+      }),
+    )
+  }
+
   ensureContext(): void {
     if (this.ctx) {
       if (this.ctx.state === 'suspended') void this.ctx.resume()
@@ -77,26 +98,53 @@ class AudioManager {
       g.connect(this.masterGain)
       this.trackGains.push(g)
     }
+
+    // iOS Safari fully unlocks audio only after actually *playing* something
+    // inside the user gesture. A 1-sample silent buffer is enough.
+    try {
+      const silent = this.ctx.createBuffer(1, 1, 22050)
+      const src = this.ctx.createBufferSource()
+      src.buffer = silent
+      src.connect(this.ctx.destination)
+      src.start(0)
+    } catch {
+      /* ignore — unlock best-effort */
+    }
+
     void this.loadBuffers()
   }
 
   private async loadBuffers(): Promise<void> {
     const ctx = this.ctx
     if (!ctx) return
+    const raw = await this.prefetched
     const results = await Promise.all(
-      AUDIO_FILES.map(async (url) => {
+      raw.map(async (ab) => {
+        if (!ab) return null
         try {
-          const res = await fetch(url)
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
-          const ab = await res.arrayBuffer()
-          return await ctx.decodeAudioData(ab)
+          // decodeAudioData detaches the source ArrayBuffer in some engines;
+          // copy so we could in principle retry (and to be safe in Safari).
+          return await ctx.decodeAudioData(ab.slice(0))
         } catch (e) {
-          console.warn(`Audio: failed to load "${url}":`, e)
+          console.warn('Audio: decode failed', e)
           return null
         }
       }),
     )
     this.buffers = results
+
+    // Race-condition safety: if the user is already ripping by the time
+    // buffers finally finish decoding, kick off the slots now so they hear
+    // sound for the rest of the tear instead of silence.
+    if (this.isRipping && this.ctx) {
+      for (let i = 0; i < 4; i++) {
+        if (!this.slots[i]) this.slots[i] = this.startSlot(i)
+      }
+      const now = this.ctx.currentTime
+      this.masterGain!.gain.cancelScheduledValues(now)
+      this.masterGain!.gain.setValueAtTime(this.masterGain!.gain.value, now)
+      this.masterGain!.gain.linearRampToValueAtTime(1, now + RAMP_MASTER_IN)
+    }
   }
 
   private startSlot(i: number): AudioSlot | null {
@@ -150,18 +198,21 @@ class AudioManager {
   }
 
   update(smoothRate: number): void {
-    if (!this.ctx || !this.buffers[0] || !this.masterGain) return
-    const now = this.ctx.currentTime
+    // Track ripping state even before buffers are ready — otherwise the
+    // retroactive slot-start in loadBuffers() never fires on slow mobiles.
     const nowMs = performance.now()
-
-    // Sustain logic: once above threshold, keep "ripping" alive for
-    // RIP_SUSTAIN_MS after the last above-threshold frame. This prevents
-    // slow/sparse breaks from toggling the audio off→on→off→on and
-    // restarting the loop slots from position 0.
     const aboveThreshold = smoothRate > RIPPING_THRESHOLD
     if (aboveThreshold) this.lastAboveThresholdMs = nowMs
     const sustained = nowMs - this.lastAboveThresholdMs < RIP_SUSTAIN_MS
     const shouldRip = aboveThreshold || (this.isRipping && sustained)
+
+    // State-only path: no context or buffers yet. Just track the flag so
+    // that when buffers finally arrive, the retroactive starter sees it.
+    if (!this.ctx || !this.buffers[0] || !this.masterGain) {
+      this.isRipping = shouldRip
+      return
+    }
+    const now = this.ctx.currentTime
 
     if (shouldRip && !this.isRipping) {
       this.isRipping = true
