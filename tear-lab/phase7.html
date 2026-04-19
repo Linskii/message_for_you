@@ -216,8 +216,6 @@
   // the bottom-half — the perforation is a stress insulator, matching the
   // "decoupled halves" model).
   const stress = new Float32Array(points.length);
-  let prevMouseX = 0;
-  let prevMouseY = 0;
 
   // Split all constraints (edges + diagonals) by which half they belong to.
   // Cross constraints are exactly the edges/diagonals that span the tear —
@@ -256,16 +254,11 @@
   // endpoints' stress exceeds BOND_BREAK_STRESS (and the endpoint/neighbour
   // propagation rule from phase 6 still holds — so the tear still zips from
   // an edge of the perforation rather than exploding mid-line).
+  // Pin fatigue: each pin accumulates stress from its physical displacement.
+  // No diffusion — pull force propagates physically via the constraint solver.
   const STRESS_DECAY = 0.88;
-  const STRESS_DIFFUSE = 0.8;
-  const STRESS_DIFFUSE_PASSES = 2;
-  const PULL_GAIN = 1;
-  const VELOCITY_GAIN = 0.3;
-  // Lowered so gravity-induced pin sag (~0.83 px) does NOT alone exceed the
-  // break threshold — otherwise every pin pops on its own without any pull.
   const PIN_STRAIN_GAIN = 0.3;
-  const PIN_BREAK_STRESS = 6;
-  const BOND_BREAK_STRESS = 8;
+  const PIN_BREAK_STRESS = 20;
 
   // Top-half pin softness. Instead of hard-snapping each pinned node back
   // to its anchor every iteration (which makes the flap feel like a board),
@@ -324,92 +317,30 @@
     }
   }
 
-  // Stress: seed at the drag point from (gap to cursor) and (mouse speed),
-  // diffuse across unbroken non-tearable edges, then decay. The non-tearable
-  // restriction is what makes the perforation act as a stress barrier — once
-  // you're pulling on the flap, stress stays in the flap and piles up against
-  // the perforation bonds rather than leaking into the letter body.
+  // Stress is now purely local: each pin accumulates fatigue from its own
+  // physical displacement. No diffusion, no drag-point seeding — the Verlet
+  // constraint solver propagates pull force physically through the mesh.
   function updateStress() {
-    if (dragPoint) {
-      const gx = dragTargetX - dragPoint.x;
-      const gy = dragTargetY - dragPoint.y;
-      const gap = Math.hypot(gx, gy);
-      const mvx = dragTargetX - prevMouseX;
-      const mvy = dragTargetY - prevMouseY;
-      const mouseSpeed = Math.hypot(mvx, mvy);
-      stress[dragPoint.i] += PULL_GAIN * gap + VELOCITY_GAIN * mouseSpeed;
-    }
-    prevMouseX = dragTargetX;
-    prevMouseY = dragTargetY;
-
-    // Pin strain: every stretched pin fatigues its own node. A region
-    // pulled taut therefore pops its own pins without stress needing to
-    // diffuse from the drag point — produces a natural local peel front.
     for (const pin of pinAnchors) {
       if (pin.broken) continue;
       const dx = pin.p.x - pin.ax;
       const dy = pin.p.y - pin.ay;
       stress[pin.p.i] += PIN_STRAIN_GAIN * Math.hypot(dx, dy);
     }
-
-    for (let pass = 0; pass < STRESS_DIFFUSE_PASSES; pass++) {
-      for (let r = 0; r < ROWS; r++) {
-        for (let c = 0; c < COLS - 1; c++) {
-          const e = hC[r][c];
-          if (e.broken || e.tearable) continue;
-          const i1 = e.p1.i;
-          const i2 = e.p2.i;
-          const flow = (stress[i2] - stress[i1]) * STRESS_DIFFUSE;
-          stress[i1] += flow;
-          stress[i2] -= flow;
-        }
-      }
-      for (let r = 0; r < ROWS - 1; r++) {
-        for (let c = 0; c < COLS; c++) {
-          const e = vC[r][c];
-          if (e.broken || e.tearable) continue;
-          const i1 = e.p1.i;
-          const i2 = e.p2.i;
-          const flow = (stress[i2] - stress[i1]) * STRESS_DIFFUSE;
-          stress[i1] += flow;
-          stress[i2] -= flow;
-        }
-      }
-    }
-
     for (let i = 0; i < stress.length; i++) stress[i] *= STRESS_DECAY;
   }
 
-  // Pulls the dragged point toward the mouse target, but never further than
-  // STRETCH_LIMIT * rest from each intact neighbor. Called every constraint
-  // iteration so stress propagates along the chain — without this the pinned
-  // drag point's neighbor snaps all the way to it in iteration 1, then the
-  // next neighbor snaps in iteration 2, and the whole mesh teleports to the
-  // cursor in ITERATIONS frames regardless of stretch limits.
-  function clampDragPoint() {
+  // Place the dragged node at the cursor every constraint iteration. It's
+  // pinned = true so relaxation leaves it alone and instead pulls its
+  // neighbors toward it — that's how physical pull force enters the mesh.
+  // No clamping: the drag node tracks the cursor fully; stretch violations
+  // resolve by the constraint solver pulling neighbors along the chain.
+  function trackCursor() {
     if (!dragPoint) return;
-    let tx = dragTargetX;
-    let ty = dragTargetY;
-    const r = dragPoint.r;
-    const c = dragPoint.c;
-    const maxD = SPACING * STRETCH_LIMIT;
-    const clampTo = (n) => {
-      const ddx = tx - n.x;
-      const ddy = ty - n.y;
-      const d = Math.hypot(ddx, ddy);
-      if (d > maxD) {
-        tx = n.x + ddx * maxD / d;
-        ty = n.y + ddy * maxD / d;
-      }
-    };
-    if (r > 0 && !vC[r - 1][c].broken) clampTo(points[idx(r - 1, c)]);
-    if (r < ROWS - 1 && !vC[r][c].broken) clampTo(points[idx(r + 1, c)]);
-    if (c > 0 && !hC[r][c - 1].broken) clampTo(points[idx(r, c - 1)]);
-    if (c < COLS - 1 && !hC[r][c].broken) clampTo(points[idx(r, c + 1)]);
-    dragPoint.x = tx;
-    dragPoint.y = ty;
-    dragPoint.old_x = tx;
-    dragPoint.old_y = ty;
+    dragPoint.x = dragTargetX;
+    dragPoint.y = dragTargetY;
+    dragPoint.old_x = dragTargetX;
+    dragPoint.old_y = dragTargetY;
   }
 
   function relaxConstraint(ct) {
@@ -418,7 +349,7 @@
     const dy = ct.p2.y - ct.p1.y;
     const dist = Math.hypot(dx, dy) || 0.0001;
 
-    if (ct.tearable && stress[ct.p1.i] + stress[ct.p2.i] > BOND_BREAK_STRESS) {
+    if (ct.tearable && dist > ct.restLength * STRETCH_LIMIT) {
       const pi = ct.pathIndex;
       const isEndpoint = (pi === 0 || pi === tearPathLen - 1);
       const prevBroken = pi > 0 && tearPath[pi - 1].broken;
@@ -474,7 +405,7 @@
 
   function satisfyConstraints() {
     for (let i = 0; i < ITERATIONS; i++) {
-      clampDragPoint();
+      trackCursor();
       for (let j = 0; j < TOP_STIFFNESS; j++) relaxGroup(topConstraints);
       for (let j = 0; j < BOTTOM_STIFFNESS; j++) relaxGroup(bottomConstraints);
       for (let j = 0; j < CROSS_STIFFNESS; j++) relaxGroup(crossConstraints);
@@ -946,8 +877,6 @@
     dragPoint.pinned = true;
     dragTargetX = x;
     dragTargetY = y;
-    prevMouseX = x;
-    prevMouseY = y;
     canvas.classList.add('dragging');
   }
 
