@@ -179,13 +179,27 @@
     }
 
     // Compute per-track gains from a blend position in [0, 1].
-    // Triangular interpolation: each track has full gain at its position
-    // and linearly falls to 0 at the adjacent track positions.
+    //
+    // Each track fades in over the segment between the previous track's position
+    // and its own.  The fastest currently-active track always has the highest gain:
+    // gains are weighted by DECAY^(stepsBelow) so each slower track is DECAY×
+    // quieter than the next faster one.
     _blendGains(blend) {
-      return BLEND_POSITIONS.map(p =>
-        Math.max(0, 1 - Math.abs(blend - p) / BLEND_WIDTH)
-      );
-      // Sum is always exactly 1 at track positions and midpoints — no normalisation needed.
+      const DECAY = 0.45;
+
+      // raw[i]: how faded-in track i is (0 = silent, 1 = fully on)
+      const raw = BLEND_POSITIONS.map((pos, i) => {
+        if (i === 0) return 1; // slow always on while ripping
+        const start = BLEND_POSITIONS[i - 1];
+        return Math.min(1, Math.max(0, (blend - start) / (pos - start)));
+      });
+
+      // Index of the fastest track with any signal
+      let maxActive = 0;
+      for (let i = 0; i < 4; i++) if (raw[i] > 0) maxActive = i;
+
+      // fastest active = full raw gain; each step slower loses DECAY×
+      return raw.map((r, i) => r * Math.pow(DECAY, maxActive - i));
     }
 
     // Map a smoothed break rate to [0, 1] on a log scale.
