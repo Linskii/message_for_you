@@ -34,6 +34,10 @@ const BLEND_POSITIONS = [0, 1 / 3, 2 / 3, 1]
 const BLEND_RATE_MIN = 3
 const BLEND_RATE_MAX = 40
 const RIPPING_THRESHOLD = 1.2
+// Once ripping, stay ripping for at least this long after the last above-
+// threshold frame. Smooths out sparse slow-rip breaks so the looping audio
+// slots keep streaming instead of restarting from position 0.
+const RIP_SUSTAIN_MS = 650
 const LOOP_OVERLAP = 0.09
 const RAMP_MASTER_IN = 0.12
 const RAMP_MASTER_OUT = 0.08
@@ -53,6 +57,7 @@ class AudioManager {
   private slots: (AudioSlot | null)[] = [null, null, null, null]
   private buffers: (AudioBuffer | null)[] = []
   private isRipping = false
+  private lastAboveThresholdMs = 0
 
   ensureContext(): void {
     if (this.ctx) {
@@ -146,16 +151,25 @@ class AudioManager {
 
   update(smoothRate: number): void {
     if (!this.ctx || !this.buffers[0] || !this.masterGain) return
-    const nowRipping = smoothRate > RIPPING_THRESHOLD
     const now = this.ctx.currentTime
+    const nowMs = performance.now()
 
-    if (nowRipping && !this.isRipping) {
+    // Sustain logic: once above threshold, keep "ripping" alive for
+    // RIP_SUSTAIN_MS after the last above-threshold frame. This prevents
+    // slow/sparse breaks from toggling the audio off→on→off→on and
+    // restarting the loop slots from position 0.
+    const aboveThreshold = smoothRate > RIPPING_THRESHOLD
+    if (aboveThreshold) this.lastAboveThresholdMs = nowMs
+    const sustained = nowMs - this.lastAboveThresholdMs < RIP_SUSTAIN_MS
+    const shouldRip = aboveThreshold || (this.isRipping && sustained)
+
+    if (shouldRip && !this.isRipping) {
       this.isRipping = true
       for (let i = 0; i < 4; i++) this.slots[i] = this.startSlot(i)
       this.masterGain.gain.cancelScheduledValues(now)
       this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now)
       this.masterGain.gain.linearRampToValueAtTime(1, now + RAMP_MASTER_IN)
-    } else if (!nowRipping && this.isRipping) {
+    } else if (!shouldRip && this.isRipping) {
       this.isRipping = false
       this.masterGain.gain.cancelScheduledValues(now)
       this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now)
@@ -166,6 +180,8 @@ class AudioManager {
     }
 
     if (this.isRipping) {
+      // During the sustained tail (rate dropped but still "ripping"), use
+      // the most recent real rate for blend so gains fade to slow naturally.
       const blend = this.rateToBlend(smoothRate)
       const gains = this.blendGains(blend)
       for (let i = 0; i < 4; i++) {
