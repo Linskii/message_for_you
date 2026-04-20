@@ -60,7 +60,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
           <div class="preload__bar"><div class="preload__fill" id="preload-fill"></div></div>
           <button class="preload__open" id="preload-open" type="button" hidden>Tap to open</button>
         </div>
-        <div class="viewer__hint" id="hint">↖ Tear the letter open</div>
+        <div class="viewer__hint" id="hint">↙ Tear the letter open</div>
       </div>
     </div>
   `
