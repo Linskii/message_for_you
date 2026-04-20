@@ -60,7 +60,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
           <div class="preload__bar"><div class="preload__fill" id="preload-fill"></div></div>
           <button class="preload__open" id="preload-open" type="button" hidden>Tap to open</button>
         </div>
-        <div class="viewer__hint" id="hint">Tear the letter open →</div>
+        <div class="viewer__hint" id="hint">↖ Tear the letter open</div>
       </div>
     </div>
   `
@@ -108,6 +108,7 @@ export async function renderViewer(root: HTMLElement, hash: string): Promise<voi
     }
     preloadEl.remove()
     mountCanvas(coverImg)
+    hintEl.classList.add('viewer__hint--visible')
   }
   openBtn.addEventListener('click', start, { once: true })
 
@@ -295,16 +296,17 @@ function injectStyles(): void {
     .viewer__hint {
       position: absolute;
       top: -1.6rem;
-      right: 0;
+      left: 0;
       color: #c0504d;
       font-size: 0.85rem;
       font-weight: 500;
       letter-spacing: 0.01em;
       pointer-events: none;
-      opacity: 1;
-      transition: opacity 1s ease;
+      opacity: 0;
+      transition: opacity 0.5s ease;
       z-index: 4;
     }
+    .viewer__hint--visible { opacity: 1; }
     .viewer__hint--fading { opacity: 0; }
   `
   document.head.appendChild(style)
