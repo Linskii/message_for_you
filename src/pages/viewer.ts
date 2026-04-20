@@ -212,8 +212,8 @@ function injectStyles(): void {
       position: absolute;
       inset: 0;
       display: flex;
-      align-items: center;
-      justify-content: center;
+      align-items: safe center;
+      justify-content: safe center;
       background: var(--bg);
       padding: 2rem;
       overflow-y: auto;
