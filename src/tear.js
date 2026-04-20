@@ -14,6 +14,16 @@
  *   4. onRevealed fires — viewer has mounted the letter HTML behind the
  *      canvas, so the reveal is seamless.
  */
+/** Preload an image and resolve once it's decoded. */
+export function preloadImage(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error(`image load failed: ${url}`));
+        img.src = url;
+    });
+}
 // ── Audio ────────────────────────────────────────────────────────────────────
 const AUDIO_FILES = [
     `${import.meta.env.BASE_URL}audio/slow.aac`,
@@ -21,20 +31,20 @@ const AUDIO_FILES = [
     `${import.meta.env.BASE_URL}audio/medium_fast.aac`,
     `${import.meta.env.BASE_URL}audio/fast.aac`,
 ];
-const BLEND_POSITIONS = [0, 1 / 3, 2 / 3, 1];
+const BLEND_POSITIONS = [0, 0.28, 0.56, 0.85];
 const BLEND_RATE_MIN = 3;
-const BLEND_RATE_MAX = 40;
+const BLEND_RATE_MAX = 25;
 const RIPPING_THRESHOLD = 1.2;
 // Once ripping, stay ripping for at least this long after the last above-
 // threshold frame. Smooths out sparse slow-rip breaks so the looping audio
 // slots keep streaming instead of restarting from position 0.
-const RIP_SUSTAIN_MS = 650;
+const RIP_SUSTAIN_MS = 500;
 const LOOP_OVERLAP = 0.09;
 const RAMP_MASTER_IN = 0.12;
 const RAMP_MASTER_OUT = 0.08;
 const RAMP_BLEND = 0.08;
 const BREAK_SMOOTH = 0.35;
-class AudioManager {
+export class AudioManager {
     constructor() {
         Object.defineProperty(this, "ctx", {
             enumerable: true,
@@ -78,10 +88,16 @@ class AudioManager {
             writable: true,
             value: 0
         });
+        Object.defineProperty(this, "unlocked", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: false
+        });
         // Raw AAC bytes, prefetched on construction (before any user gesture) so
         // that on mobile the slow network + small CPU doesn't cause the first rip
-        // to finish before buffers are ready. decodeAudioData still runs once the
-        // AudioContext exists, but that part is fast on pre-downloaded bytes.
+        // to finish before buffers are ready. The decode step runs inside unlock(),
+        // which must be called from a user-gesture handler (iOS/Safari).
         Object.defineProperty(this, "prefetched", {
             enumerable: true,
             configurable: true,
@@ -101,49 +117,52 @@ class AudioManager {
             }
         }));
     }
-    ensureContext() {
-        if (this.ctx) {
-            if (this.ctx.state === 'suspended')
-                void this.ctx.resume();
+    /** Resolves once raw audio bytes are downloaded (not yet decoded). */
+    waitForBytes() {
+        return this.prefetched;
+    }
+    /**
+     * Create the AudioContext and decode all buffers. Must be called from
+     * inside a user-gesture handler (click/touch) so iOS unlocks audio. The
+     * AudioContext creation and silent-buffer unlock happen synchronously
+     * (before any await) so the gesture counts; decode is awaited afterwards.
+     */
+    async unlock() {
+        if (this.unlocked)
             return;
-        }
+        this.unlocked = true;
+        // SYNC: must finish before the first await to preserve the user gesture.
         const AC = window.AudioContext ||
             window.webkitAudioContext;
-        this.ctx = new AC();
-        this.masterGain = this.ctx.createGain();
-        this.masterGain.gain.setValueAtTime(0, this.ctx.currentTime);
-        this.masterGain.connect(this.ctx.destination);
+        const ctx = new AC();
+        this.ctx = ctx;
+        this.masterGain = ctx.createGain();
+        this.masterGain.gain.setValueAtTime(0, ctx.currentTime);
+        this.masterGain.connect(ctx.destination);
         for (let i = 0; i < 4; i++) {
-            const g = this.ctx.createGain();
-            g.gain.setValueAtTime(0, this.ctx.currentTime);
+            const g = ctx.createGain();
+            g.gain.setValueAtTime(0, ctx.currentTime);
             g.connect(this.masterGain);
             this.trackGains.push(g);
         }
-        // iOS Safari fully unlocks audio only after actually *playing* something
-        // inside the user gesture. A 1-sample silent buffer is enough.
         try {
-            const silent = this.ctx.createBuffer(1, 1, 22050);
-            const src = this.ctx.createBufferSource();
+            const silent = ctx.createBuffer(1, 1, 22050);
+            const src = ctx.createBufferSource();
             src.buffer = silent;
-            src.connect(this.ctx.destination);
+            src.connect(ctx.destination);
             src.start(0);
         }
         catch {
             /* ignore — unlock best-effort */
         }
-        void this.loadBuffers();
-    }
-    async loadBuffers() {
-        const ctx = this.ctx;
-        if (!ctx)
-            return;
+        // ASYNC: decode all buffers. Bytes are already downloaded.
         const raw = await this.prefetched;
         const results = await Promise.all(raw.map(async (ab) => {
             if (!ab)
                 return null;
             try {
                 // decodeAudioData detaches the source ArrayBuffer in some engines;
-                // copy so we could in principle retry (and to be safe in Safari).
+                // copy so we could retry (and to be safe in Safari).
                 return await ctx.decodeAudioData(ab.slice(0));
             }
             catch (e) {
@@ -152,19 +171,17 @@ class AudioManager {
             }
         }));
         this.buffers = results;
-        // Race-condition safety: if the user is already ripping by the time
-        // buffers finally finish decoding, kick off the slots now so they hear
-        // sound for the rest of the tear instead of silence.
-        if (this.isRipping && this.ctx) {
-            for (let i = 0; i < 4; i++) {
-                if (!this.slots[i])
-                    this.slots[i] = this.startSlot(i);
+        if (ctx.state === 'suspended') {
+            try {
+                await ctx.resume();
             }
-            const now = this.ctx.currentTime;
-            this.masterGain.gain.cancelScheduledValues(now);
-            this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-            this.masterGain.gain.linearRampToValueAtTime(1, now + RAMP_MASTER_IN);
+            catch { /* ignore */ }
         }
+    }
+    /** Resume context if suspended (cheap no-op if already running). */
+    ensureContext() {
+        if (this.ctx && this.ctx.state === 'suspended')
+            void this.ctx.resume();
     }
     startSlot(i) {
         const buf = this.buffers[i];
@@ -219,16 +236,15 @@ class AudioManager {
         return Math.min(1, Math.log(rate / BLEND_RATE_MIN) / Math.log(BLEND_RATE_MAX / BLEND_RATE_MIN));
     }
     update(smoothRate) {
-        // Track ripping state even before buffers are ready — otherwise the
-        // retroactive slot-start in loadBuffers() never fires on slow mobiles.
         const nowMs = performance.now();
         const aboveThreshold = smoothRate > RIPPING_THRESHOLD;
         if (aboveThreshold)
             this.lastAboveThresholdMs = nowMs;
         const sustained = nowMs - this.lastAboveThresholdMs < RIP_SUSTAIN_MS;
         const shouldRip = aboveThreshold || (this.isRipping && sustained);
-        // State-only path: no context or buffers yet. Just track the flag so
-        // that when buffers finally arrive, the retroactive starter sees it.
+        // Context/buffers should always be ready here (viewer awaits unlock()
+        // before mounting the canvas). If decode failed for *every* file, fall
+        // back silently instead of crashing.
         if (!this.ctx || !this.buffers[0] || !this.masterGain) {
             this.isRipping = shouldRip;
             return;
@@ -512,6 +528,12 @@ export class TearCanvas {
             writable: true,
             value: false
         });
+        Object.defineProperty(this, "firstRipFired", {
+            enumerable: true,
+            configurable: true,
+            writable: true,
+            value: false
+        });
         // Physics state (recreated on resize).
         Object.defineProperty(this, "points", {
             enumerable: true,
@@ -653,12 +675,12 @@ export class TearCanvas {
             writable: true,
             value: 0
         });
-        // Audio.
+        // Audio (owned by viewer, passed in fully unlocked + decoded).
         Object.defineProperty(this, "audio", {
             enumerable: true,
             configurable: true,
             writable: true,
-            value: new AudioManager()
+            value: void 0
         });
         Object.defineProperty(this, "frameBreaks", {
             enumerable: true,
@@ -739,10 +761,17 @@ export class TearCanvas {
                     this.smoothBreakRate =
                         this.smoothBreakRate * (1 - BREAK_SMOOTH) + this.frameBreaks * BREAK_SMOOTH;
                     this.audio.update(this.smoothBreakRate);
+                    // First tearable edge breaks → fire hint-fade callback exactly once.
+                    if (!this.firstRipFired && this.frameBreaks > 0) {
+                        this.firstRipFired = true;
+                        this.opts.onFirstRip?.();
+                    }
                     // Detect tear completion.
                     if (!this.tearFinished && this.tearStarted && this.allTearPathBroken()) {
                         this.tearFinished = true;
                         this.tearFinishedAt = performance.now();
+                        // Kill audio immediately — the letter is open, no more rip sound.
+                        this.audio.stop();
                     }
                     // After physics continuation, begin slide.
                     if (this.tearFinished &&
@@ -758,6 +787,7 @@ export class TearCanvas {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.opts = opts;
+        this.audio = opts.audio;
         this.offCanvas = document.createElement('canvas');
         this.offCtx = this.offCanvas.getContext('2d');
         this.textureCanvas = document.createElement('canvas');
@@ -765,15 +795,10 @@ export class TearCanvas {
         this.W = canvas.width;
         this.H = canvas.height;
         this.buildGrid();
-        if (opts.coverUrl) {
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.src = opts.coverUrl;
-            img.onload = () => {
-                this.coverImg = img;
-                this.coverReady = true;
-                this.rebuildTexture();
-            };
+        if (opts.coverImg) {
+            this.coverImg = opts.coverImg;
+            this.coverReady = true;
+            this.rebuildTexture();
         }
         this.bindEvents();
         this.loop();
@@ -952,8 +977,12 @@ export class TearCanvas {
         const onStart = (clientX, clientY) => {
             if (this.revealed || this.sliding)
                 return;
-            this.audio.ensureContext();
             const { x, y } = this.canvasCoords(clientX, clientY);
+            // Nodes only live in the top strip. Clicks on the static bottom must
+            // not teleport the nearest strip node down into the click position.
+            if (y >= this.stripH)
+                return;
+            this.audio.ensureContext();
             this.dragPoint = this.findNearest(x, y);
             if (!this.dragPoint)
                 return;

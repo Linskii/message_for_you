@@ -1,5 +1,5 @@
 import { decryptMessage } from '../crypto';
-import { TearCanvas } from '../tear';
+import { AudioManager, TearCanvas, preloadImage } from '../tear';
 export async function renderViewer(root, hash) {
     const colonIdx = hash.indexOf(':');
     const messageId = hash.slice(0, colonIdx);
@@ -51,32 +51,80 @@ export async function renderViewer(root, hash) {
             <p class="letter__text">${escapeHtml(plaintext)}</p>
           </div>
         </div>
-        <canvas class="viewer__canvas" id="tear-canvas"></canvas>
+        <div class="viewer__preload" id="preload" aria-live="polite">
+          <p class="preload__status" id="preload-status">Preparing your message…</p>
+          <div class="preload__bar"><div class="preload__fill" id="preload-fill"></div></div>
+          <button class="preload__open" id="preload-open" type="button" hidden>Tap to open</button>
+        </div>
+        <div class="viewer__hint" id="hint">Tear the letter open →</div>
       </div>
     </div>
   `;
-    const canvas = document.getElementById('tear-canvas');
     const stage = document.getElementById('stage');
     const letter = document.getElementById('letter');
-    requestAnimationFrame(() => {
-        canvas.width = stage.clientWidth || 480;
-        canvas.height = stage.clientHeight || 680;
-        const tc = new TearCanvas(canvas, {
-            coverUrl,
-            jagStyle: template?.jagStyle ?? 'light',
-            onRevealed: () => {
-                // Canvas has slid its content off-screen; remove it and let the
-                // already-mounted letter breathe with a gentle fade-up.
-                canvas.remove();
-                letter.classList.add('viewer__letter--revealed');
-            },
+    const preloadEl = document.getElementById('preload');
+    const statusEl = document.getElementById('preload-status');
+    const fillEl = document.getElementById('preload-fill');
+    const openBtn = document.getElementById('preload-open');
+    const hintEl = document.getElementById('hint');
+    // ── parallel preload: audio bytes + cover image ─────────────────────────────
+    const audio = new AudioManager();
+    const total = coverUrl ? 2 : 1;
+    let done = 0;
+    const bump = () => {
+        done++;
+        fillEl.style.width = `${Math.round((done / total) * 100)}%`;
+    };
+    const imgPromise = coverUrl
+        ? preloadImage(coverUrl).then((img) => { bump(); return img; }, (err) => { console.warn('cover preload failed', err); bump(); return null; })
+        : Promise.resolve(null);
+    const bytesPromise = audio.waitForBytes().then(() => { bump(); });
+    const [coverImg] = await Promise.all([imgPromise, bytesPromise]);
+    // ── show Tap-to-open button ─────────────────────────────────────────────────
+    statusEl.textContent = '';
+    openBtn.hidden = false;
+    const start = async () => {
+        openBtn.disabled = true;
+        statusEl.textContent = 'Loading…';
+        try {
+            await audio.unlock();
+        }
+        catch (e) {
+            console.warn('audio unlock failed', e);
+        }
+        preloadEl.remove();
+        mountCanvas(coverImg);
+    };
+    openBtn.addEventListener('click', start, { once: true });
+    function mountCanvas(cover) {
+        const canvas = document.createElement('canvas');
+        canvas.className = 'viewer__canvas';
+        canvas.id = 'tear-canvas';
+        stage.appendChild(canvas);
+        requestAnimationFrame(() => {
+            canvas.width = stage.clientWidth || 480;
+            canvas.height = stage.clientHeight || 680;
+            const tc = new TearCanvas(canvas, {
+                coverImg: cover,
+                audio,
+                jagStyle: template?.jagStyle ?? 'light',
+                onFirstRip: () => {
+                    // Fade the hint out over 1 second.
+                    hintEl.classList.add('viewer__hint--fading');
+                    setTimeout(() => hintEl.remove(), 1100);
+                },
+                onRevealed: () => {
+                    canvas.remove();
+                    letter.classList.add('viewer__letter--revealed');
+                },
+            });
+            window.addEventListener('resize', () => {
+                canvas.width = stage.clientWidth;
+                canvas.height = stage.clientHeight;
+                tc.resize(canvas.width, canvas.height);
+            });
         });
-        window.addEventListener('resize', () => {
-            canvas.width = stage.clientWidth;
-            canvas.height = stage.clientHeight;
-            tc.resize(canvas.width, canvas.height);
-        });
-    });
+    }
 }
 // ── helpers ───────────────────────────────────────────────────────────────────
 function showError(root, msg) {
@@ -120,7 +168,7 @@ function injectStyles() {
       width: min(480px, 90vw);
       height: min(680px, 85vh);
       border-radius: 4px;
-      overflow: hidden;
+      overflow: visible;
       box-shadow: 0 8px 40px rgba(0,0,0,0.12);
       cursor: grab;
       background: var(--bg);
@@ -135,6 +183,7 @@ function injectStyles() {
       height: 100%;
       touch-action: none;
       z-index: 2;
+      border-radius: 4px;
     }
 
     .viewer__letter {
@@ -150,6 +199,7 @@ function injectStyles() {
       transform: translateY(6px);
       transition: opacity 0.5s ease 0.05s, transform 0.5s ease 0.05s;
       z-index: 1;
+      border-radius: 4px;
     }
     .viewer__letter--revealed {
       opacity: 1;
@@ -171,6 +221,70 @@ function injectStyles() {
       line-height: 1.9;
       color: var(--ink);
     }
+
+    .viewer__preload {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.2rem;
+      padding: 2rem;
+      background: var(--bg);
+      z-index: 3;
+      border-radius: 4px;
+    }
+    .preload__status {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin: 0;
+      text-align: center;
+      min-height: 1.4em;
+    }
+    .preload__bar {
+      width: min(220px, 70%);
+      height: 4px;
+      background: rgba(0,0,0,0.08);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .preload__fill {
+      width: 0%;
+      height: 100%;
+      background: var(--accent, #c0504d);
+      transition: width 0.25s ease;
+    }
+    .preload__open {
+      font: inherit;
+      font-size: 1rem;
+      padding: 0.7rem 1.6rem;
+      border-radius: 999px;
+      border: 1px solid rgba(0,0,0,0.15);
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+      transition: transform 0.1s ease, box-shadow 0.15s ease;
+    }
+    .preload__open:hover { box-shadow: 0 3px 14px rgba(0,0,0,0.1); }
+    .preload__open:active { transform: translateY(1px); }
+    .preload__open:disabled { opacity: 0.6; cursor: default; }
+
+    .viewer__hint {
+      position: absolute;
+      top: -1.6rem;
+      right: 0;
+      color: #c0504d;
+      font-size: 0.85rem;
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      pointer-events: none;
+      opacity: 1;
+      transition: opacity 1s ease;
+      z-index: 4;
+    }
+    .viewer__hint--fading { opacity: 0; }
   `;
     document.head.appendChild(style);
 }
